@@ -6,6 +6,16 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, LlamaForCausalLM
 
+# Optional FlashSVD kernels (RoPE Attention and rank-space FFN)
+try:
+    from decoders.llama.kernels.flashsvdropeattn import FlashSVDRoPEAttention, QKVFactors
+except Exception:
+    FlashSVDRoPEAttention, QKVFactors = None, None
+try:
+    from decoders.llama.kernels.flashsvdswiglu import flashsvd_ffn_swiglu  # SwiGLU (LLaMA-style)
+except Exception:
+    flashsvd_ffn_swiglu = None
+
 from typing import Optional
 
 """
@@ -259,6 +269,132 @@ class SVDLlamaBlock(nn.Module):
                     try: delattr(obj, name)
                     except Exception: pass
 
+        # ───────── FlashSVD precomputation (eval/prefill attention + FFN) ─────────
+        self._flash_attn_enabled = False
+        self._flash_ffn_enabled = False
+        self._rope_adapter = None
+
+        # Conditions: kernels available and ranks compatible (Q/K/V share rank per head)
+        if (FlashSVDRoPEAttention is not None):
+            # Require equal per-head ranks for Q/K/V to feed one R into kernel
+            rq = self.q_Us.shape[-1]
+            rk = self.k_Us.shape[-1]
+            rv = self.v_Us.shape[-1]
+            if (rq == rk == rv):
+                self._flash_r = int(rq)
+
+                # Build V_rank (right) concatenations: [D, H*R]
+                D = self.d_model
+                H = self.n_heads
+                Hk = self.n_kv_heads
+                R = self._flash_r
+                n_rep = self.n_rep
+
+                # q_V: [H, R, D] -> [D, H*R]
+                q_V_cat = self.q_V.permute(0, 2, 1).contiguous().view(D, H * R)
+
+                # k_V/v_V: [Hk, R, D] -> repeat over heads -> [D, H*R]
+                k_V_rep = self.k_V
+                v_V_rep = self.v_V
+                if Hk != H:
+                    # repeat across head replication
+                    k_V_rep = k_V_rep.repeat_interleave(n_rep, dim=0)
+                    v_V_rep = v_V_rep.repeat_interleave(n_rep, dim=0)
+                k_V_cat = k_V_rep.permute(0, 2, 1).contiguous().view(D, H * R)
+                v_V_cat = v_V_rep.permute(0, 2, 1).contiguous().view(D, H * R)
+
+                # Build block-diagonal Us as [H*R, H*dh]
+                def _block_us(Us_hrd: torch.Tensor, heads: int) -> torch.Tensor:
+                    # Us_hrd: [H or Hk, dh, R]
+                    dh, r = Us_hrd.shape[1], Us_hrd.shape[2]
+                    if Us_hrd.size(0) != heads:
+                        # replicate KV heads
+                        Us_hrd = Us_hrd.repeat_interleave(n_rep, dim=0)
+                    out = torch.zeros(heads * r, heads * dh, dtype=Us_hrd.dtype, device=Us_hrd.device)
+                    for h in range(heads):
+                        rs = h * r
+                        re = rs + r
+                        cs = h * dh
+                        ce = cs + dh
+                        # place [R, dh]
+                        out[rs:re, cs:ce] = Us_hrd[h].permute(1, 0)
+                    return out
+
+                Vq_flat = _block_us(self.q_Us, H)  # [H*R, H*dh]
+                Vk_flat = _block_us(self.k_Us, H)
+                Vv_flat = _block_us(self.v_Us, H)
+
+                # Register as buffers to keep on correct device/dtype
+                self.register_buffer("_flash_Vq_rank", q_V_cat.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_flash_Vk_rank", k_V_cat.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_flash_Vv_rank", v_V_cat.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_flash_Vq_flat", Vq_flat.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_flash_Vk_flat", Vk_flat.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_flash_Vv_flat", Vv_flat.to(self.factor_dtype), persistent=False)
+
+                # RoPE adapter to produce BHxMxDh cos/sin from our shape-safe RoPE
+                class _RoPEAdapter(nn.Module):
+                    def __init__(self, parent):
+                        super().__init__()
+                        self.parent = parent
+                    def forward(self, x_bmd: torch.Tensor, *, position_ids: torch.Tensor):
+                        # x_bmd: [B*H, M, dh]
+                        BxH, M, dh = x_bmd.shape
+                        H = self.parent.n_heads
+                        B = max(1, BxH // max(1, H))
+                        # Build dummy [B,H,M,dh] to drive cos/sin creation
+                        dummy_bhtd = torch.empty((B, H, M, dh), device=x_bmd.device, dtype=x_bmd.dtype)
+                        # Recover [B, M] pos_ids
+                        pos_bhm = position_ids.view(B, H, M)
+                        pos_bm = pos_bhm[:, 0, :]
+                        cos_h, sin_h = self.parent._rope_get_cos_sin(dummy_bhtd, position_ids=pos_bm, seq_len=M)
+                        # cos_h/sin_h: [B,1,M,half] -> make full Dh by duplicating halves
+                        half = dh // 2
+                        cos_full = torch.cat([cos_h, cos_h], dim=-1)  # [B,1,M,dh]
+                        sin_full = torch.cat([sin_h, sin_h], dim=-1)
+                        # Expand over heads and flatten to [B*H, M, dh]
+                        cos_full = cos_full.expand(B, H, M, dh).contiguous().view(B * H, M, dh)
+                        sin_full = sin_full.expand(B, H, M, dh).contiguous().view(B * H, M, dh)
+                        return cos_full, sin_full
+
+                self._rope_adapter = _RoPEAdapter(self)
+                try:
+                    self._flash_attn = FlashSVDRoPEAttention(self.n_heads, self.head_dim, self._rope_adapter)
+                    self._flash_attn_enabled = True
+                except Exception:
+                    self._flash_attn_enabled = False
+
+        # FFN FlashSVD (SwiGLU) if low-rank FF is enabled
+        if flashsvd_ffn_swiglu is not None and getattr(self, "use_lowrank_ff", False):
+            try:
+                # Build combined U1/V1 from gate+up decompositions
+                Dm = self.d_model
+                Din = int(getattr(cfg, "intermediate_size"))
+                rg = self.g_Us.shape[1]
+                ru = self.u_Us.shape[1]
+                R1 = rg + ru
+                # U1: [Dm, R1]
+                U1 = torch.cat([self.g_V.t(), self.u_V.t()], dim=1).contiguous()
+                # V1: [R1, 2*Din] -> block place
+                V1 = torch.zeros((R1, 2 * Din), dtype=self.g_Us.dtype, device=self.g_Us.device)
+                V1[:rg, :Din] = self.g_Us.t().contiguous()
+                V1[rg:, Din:] = self.u_Us.t().contiguous()
+                # U2, V2 from down_proj: W_down ~ Us@V ; need U2=[Din,R2], V2=[R2,Dm]
+                R2 = self.d_Us.shape[1]
+                U2 = self.d_V.t().contiguous()
+                V2 = self.d_Us.t().contiguous()
+                b1 = torch.zeros(2 * Din, dtype=V1.dtype, device=V1.device)
+                b2 = torch.zeros(Dm, dtype=V2.dtype, device=V2.device)
+                self.register_buffer("_ffn_U1", U1.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_ffn_V1", V1.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_ffn_U2", U2.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_ffn_V2", V2.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_ffn_b1", b1.to(self.factor_dtype), persistent=False)
+                self.register_buffer("_ffn_b2", b2.to(self.factor_dtype), persistent=False)
+                self._flash_ffn_enabled = True
+            except Exception:
+                self._flash_ffn_enabled = False
+
     # ─────────── RoPE helpers (half-split, shape-safe) ───────────
     @torch.no_grad()
     def _rope_get_cos_sin(self, x_bhtd, position_ids=None, seq_len=None):
@@ -413,29 +549,60 @@ class SVDLlamaBlock(nn.Module):
             x_trim = x[:, :T_max, :]
             pos_ids = position_ids[:, :T_max] if position_ids is not None else None
 
-        # Q per-head
-        q = self._proj_per_head(x_trim, self.q_Us, self.q_V)         # [B,H,T,dh]
-
         if not use_cache:
-            # ---------- Evaluation path ----------
-            k_raw = self._proj_per_head(x_trim, self.k_Us, self.k_V)     # [B,Hk,T,dh]
-            v_raw = self._proj_per_head(x_trim, self.v_Us, self.v_V)
-            k = _repeat_kv(k_raw, self.n_rep)                             # [B,H,T,dh]
-            v = _repeat_kv(v_raw, self.n_rep)
-            q, k = self._apply_rope(q, k, pos_ids, position_embeddings=position_embeddings)
+            # ---------- Evaluation/prefill path ----------
+            if self._flash_attn_enabled:
+                # Build rank-space P tensors and call fused FlashSVD+RoPE kernel
+                R = self._flash_r
+                # Pq: [B,H,T,R] -> [B,T,H*R]
+                Pq = self._proj_per_head_lowrank(x_trim, self.q_V).permute(0, 2, 1, 3).contiguous().view(B, T_max, self.n_heads * R)
+                # Pk/Pv from KV heads with replication to H
+                Pk_h = self._proj_per_head_lowrank(x_trim, self.k_V)  # [B,Hk,T,R]
+                Pv_h = self._proj_per_head_lowrank(x_trim, self.v_V)
+                if self.n_kv_heads != self.n_heads:
+                    # replicate along head dim
+                    Pk_h = Pk_h.repeat_interleave(self.n_rep, dim=1)
+                    Pv_h = Pv_h.repeat_interleave(self.n_rep, dim=1)
+                Pk = Pk_h.permute(0, 2, 1, 3).contiguous().view(B, T_max, self.n_heads * R)
+                Pv = Pv_h.permute(0, 2, 1, 3).contiguous().view(B, T_max, self.n_heads * R)
 
-            q_bhsd = q.contiguous()
-            k_bhsd = k.contiguous()
-            v_bhsd = v.contiguous()
+                # RoPE position ids (trimmed)
+                pos_for_kernel = pos_ids if pos_ids is not None else torch.arange(T_max, device=x_trim.device).unsqueeze(0).expand(B, -1)
 
-            bias = _build_full_bias(attention_mask, B, T_max, k_bhsd.size(-2), q_bhsd.device, q_bhsd.dtype)
-            attn_sdpa = F.scaled_dot_product_attention(q_bhsd, k_bhsd, v_bhsd, attn_mask=bias, is_causal=False)
-            present_out = None
+                qkv = QKVFactors(
+                    Pq=Pq.to(self.factor_dtype), Pk=Pk.to(self.factor_dtype), Pv=Pv.to(self.factor_dtype),
+                    Vq=self._flash_Vq_flat, Vk=self._flash_Vk_flat, Vv=self._flash_Vv_flat,
+                    bq=None, bk=None, bv=None,
+                )
+                O_bmhd = self._flash_attn(qkv, attention_mask=attention_mask, position_ids=pos_for_kernel)
+                # Convert to [B,H,T,dh]
+                attn_bhtd = O_bmhd.permute(0, 2, 1, 3).contiguous()
+                attn_sdpa = attn_bhtd
+                if self.debug_cache and (self.layer_idx in (None, 0)):
+                    print("[FlashSVD] eval/prefill path: fused RoPE attention kernel in use")
+                present_out = None
+            else:
+                # Fallback: dense Q/K/V tensors via SDPA
+                q = self._proj_per_head(x_trim, self.q_Us, self.q_V)         # [B,H,T,dh]
+                k_raw = self._proj_per_head(x_trim, self.k_Us, self.k_V)     # [B,Hk,T,dh]
+                v_raw = self._proj_per_head(x_trim, self.v_Us, self.v_V)
+                k = _repeat_kv(k_raw, self.n_rep)                             # [B,H,T,dh]
+                v = _repeat_kv(v_raw, self.n_rep)
+                q, k = self._apply_rope(q, k, pos_ids, position_embeddings=position_embeddings)
+
+                q_bhsd = q.contiguous()
+                k_bhsd = k.contiguous()
+                v_bhsd = v.contiguous()
+
+                bias = _build_full_bias(attention_mask, B, T_max, k_bhsd.size(-2), q_bhsd.device, q_bhsd.dtype)
+                attn_sdpa = F.scaled_dot_product_attention(q_bhsd, k_bhsd, v_bhsd, attn_mask=bias, is_causal=False)
+                present_out = None
 
         else:
-            # ---------- Decode path (ASVD only) ----------
+            # ---------- Decode path (ASVD; prefill uses FlashSVD to avoid dense K/V) ----------
+            is_prefill = (past_key_value is None)
             # Reset ASVD cache at the start of a sequence
-            if past_key_value is None:
+            if is_prefill:
                 self._asvd_pk = None
                 self._asvd_pv = None
 
@@ -451,40 +618,68 @@ class SVDLlamaBlock(nn.Module):
 
             pk_seq, pv_seq = self._asvd_pk, self._asvd_pv  # [B,Hk,K,r]
 
-            # Reconstruct K,V and apply RoPE
-            k_seq = self._reconstruct_from_P(pk_seq, self.k_Us, out_dtype=q.dtype)  # [B,Hk,K,dh]
-            v_seq = self._reconstruct_from_P(pv_seq, self.v_Us, out_dtype=q.dtype)
+            if is_prefill and self._flash_attn_enabled:
+                # Use FlashSVD kernel over the full prompt to avoid dense K/V reconstruction
+                R = self._flash_r
+                # Build Pq for current window (prefill window == full prompt)
+                Pq_h = self._proj_per_head_lowrank(x_trim, self.q_V)  # [B,H,T,r]
+                # Replicate KV heads to H and flatten to [B,T,H*R]
+                if self.n_kv_heads != self.n_heads:
+                    Pk_full = pk_seq.repeat_interleave(self.n_rep, dim=1)
+                    Pv_full = pv_seq.repeat_interleave(self.n_rep, dim=1)
+                else:
+                    Pk_full = pk_seq
+                    Pv_full = pv_seq
+                Pq = Pq_h.permute(0, 2, 1, 3).contiguous().view(B, T_max, self.n_heads * R)
+                Pk = Pk_full.permute(0, 2, 1, 3).contiguous().view(B, T_max, self.n_heads * R)
+                Pv = Pv_full.permute(0, 2, 1, 3).contiguous().view(B, T_max, self.n_heads * R)
 
-            q_bhtd = self._apply_rope_single(q, position_ids=pos_ids)              # [B,H,T,dh]
-            k_len = k_seq.size(-2)
-            k_bhtd = self._apply_rope_single(k_seq, position_ids=None, seq_len=k_len)
-
-            k_bhsd = _repeat_kv(k_bhtd, self.n_rep)         # [B,H,K,dh]
-            v_bhsd = _repeat_kv(v_seq,  self.n_rep)
-            q_bhsd = q_bhtd.contiguous()
-
-            if attention_mask is not None and attention_mask.dim() == 4:
-                bias = attention_mask.to(dtype=q_bhsd.dtype, device=q_bhsd.device)
-                bias = bias[..., -T_max:, -k_len:]
-                if (not bias.is_contiguous()):
-                    bias = bias.contiguous().clone()
+                pos_for_kernel = pos_ids if pos_ids is not None else torch.arange(T_max, device=x_trim.device).unsqueeze(0).expand(B, -1)
+                qkv = QKVFactors(
+                    Pq=Pq.to(self.factor_dtype), Pk=Pk.to(self.factor_dtype), Pv=Pv.to(self.factor_dtype),
+                    Vq=self._flash_Vq_flat, Vk=self._flash_Vk_flat, Vv=self._flash_Vv_flat,
+                    bq=None, bk=None, bv=None,
+                )
+                O_bmhd = self._flash_attn(qkv, attention_mask=attention_mask, position_ids=pos_for_kernel)
+                attn_sdpa = O_bmhd.permute(0, 2, 1, 3).contiguous()  # [B,H,T,dh]
+                if self.debug_cache and (self.layer_idx in (None, 0)):
+                    print("[FlashSVD] decode prefill: fused RoPE attention kernel in use")
+                present_out = None
             else:
-                bias = _build_full_bias(attention_mask, B, T_max, k_len, q_bhsd.device, q_bhsd.dtype)
+                # Fallback (streaming token): reconstruct K,V of full seq K and compute attention
+                q = self._proj_per_head(x_trim, self.q_Us, self.q_V)         # [B,H,T,dh]
+                k_seq = self._reconstruct_from_P(pk_seq, self.k_Us, out_dtype=q.dtype)  # [B,Hk,K,dh]
+                v_seq = self._reconstruct_from_P(pv_seq, self.v_Us, out_dtype=q.dtype)
 
-            if self.debug_cache and (self.layer_idx in (None, 0)):
-                print(f"[ASVD] layer_idx={self.layer_idx} Pk={tuple(pk_seq.shape)} Pv={tuple(pv_seq.shape)} K={k_len}")
-                print(f"[ASVD] q={tuple(q_bhtd.shape)} k={tuple(k_bhtd.shape)} v={tuple(v_seq.shape)} T_max={T_max}")
+                q_bhtd = self._apply_rope_single(q, position_ids=pos_ids)              # [B,H,T,dh]
+                k_len = k_seq.size(-2)
+                k_bhtd = self._apply_rope_single(k_seq, position_ids=None, seq_len=k_len)
 
-            scale = 1.0 / math.sqrt(self.head_dim)
-            qf = q_bhsd.float(); kf = k_bhsd.float(); vf = v_bhsd.float()
-            logits = torch.einsum('b h t d, b h k d -> b h t k', qf, kf) * scale
-            if bias is not None:
-                logits = logits + bias
-            weights = torch.softmax(logits, dim=-1)
-            attn_sdpa = torch.einsum('b h t k, b h k d -> b h t d', weights, vf).to(q_bhsd.dtype)
+                k_bhsd = _repeat_kv(k_bhtd, self.n_rep)         # [B,H,K,dh]
+                v_bhsd = _repeat_kv(v_seq,  self.n_rep)
+                q_bhsd = q_bhtd.contiguous()
 
-            # In ASVD mode, we do not return legacy tuple caches to HF
-            present_out = None
+                if attention_mask is not None and attention_mask.dim() == 4:
+                    bias = attention_mask.to(dtype=q_bhsd.dtype, device=q_bhsd.device)
+                    bias = bias[..., -T_max:, -k_len:]
+                    if (not bias.is_contiguous()):
+                        bias = bias.contiguous().clone()
+                else:
+                    bias = _build_full_bias(attention_mask, B, T_max, k_len, q_bhsd.device, q_bhsd.dtype)
+
+                if self.debug_cache and (self.layer_idx in (None, 0)):
+                    print(f"[ASVD] fallback decode step: layer_idx={self.layer_idx} Pk={tuple(pk_seq.shape)} Pv={tuple(pv_seq.shape)} K={k_len}")
+
+                scale = 1.0 / math.sqrt(self.head_dim)
+                qf = q_bhsd.float(); kf = k_bhsd.float(); vf = v_bhsd.float()
+                logits = torch.einsum('b h t d, b h k d -> b h t k', qf, kf) * scale
+                if bias is not None:
+                    logits = logits + bias
+                weights = torch.softmax(logits, dim=-1)
+                attn_sdpa = torch.einsum('b h t k, b h k d -> b h t d', weights, vf).to(q_bhsd.dtype)
+
+                # In ASVD mode, we do not return legacy tuple caches to HF
+                present_out = None
 
         # Merge heads
         attn = attn_sdpa.transpose(1, 2).contiguous().view(B, T_max, self.n_heads * self.head_dim)
@@ -499,9 +694,17 @@ class SVDLlamaBlock(nn.Module):
         y = self.ln2(h)
 
         if getattr(self, "use_lowrank_ff", False):
-            y1 = (y.to(self.g_V.dtype) @ self.g_V.t()) @ self.g_Us.t()
-            y2 = (y.to(self.u_V.dtype) @ self.u_V.t()) @ self.u_Us.t()
-            ff = ((F.silu(y1) * y2) @ self.d_V.t()) @ self.d_Us.t()
+            if self._flash_ffn_enabled:
+                # Rank-space SwiGLU fusion
+                P_ff = y.to(self._ffn_U1.dtype) @ self._ffn_U1
+                ff = flashsvd_ffn_swiglu(
+                    P_ff, self._ffn_V1, self._ffn_U2, self._ffn_V2, self._ffn_b1, self._ffn_b2,
+                    use_autotune=True
+                )
+            else:
+                y1 = (y.to(self.g_V.dtype) @ self.g_V.t()) @ self.g_Us.t()
+                y2 = (y.to(self.u_V.dtype) @ self.u_V.t()) @ self.u_Us.t()
+                ff = ((F.silu(y1) * y2) @ self.d_V.t()) @ self.d_Us.t()
         else:
             ff = self.down(F.silu(self.gate(y)) * self.up(y))
 
@@ -687,7 +890,7 @@ def profile_prefill_and_decode(model, tok: AutoTokenizer, device: str,
     # Prefill (ASVD: no legacy tuples; HF cache remains None)
     model.config.use_cache = True
     if torch.cuda.is_available():
-        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+        torch.cuda.empty_cache(); torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
     storage_before = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
 
     supports_cache_pos = _supports_kwarg(model.forward, "cache_position")
@@ -705,8 +908,13 @@ def profile_prefill_and_decode(model, tok: AutoTokenizer, device: str,
 
     if torch.cuda.is_available(): torch.cuda.synchronize()
     prefill_ms = (time.perf_counter() - t0) * 1000.0
-    prefill_peak = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
-    prefill_current = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        prefill_peak = torch.cuda.max_memory_allocated() / 1024**2
+        prefill_current = torch.cuda.memory_allocated() / 1024**2
+    else:
+        prefill_peak = 0.0
+        prefill_current = 0.0
     present = out.past_key_values
     prefill_kv_bytes_asvd = _measure_asvd_cache_mib(model)
 
@@ -715,7 +923,7 @@ def profile_prefill_and_decode(model, tok: AutoTokenizer, device: str,
     next_ids = input_ids[:, -1:]
     decode_start_alloc = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
     if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+        torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
     t_dec = 0.0
     decode_kv_bytes_asvd = prefill_kv_bytes_asvd
 
@@ -742,7 +950,11 @@ def profile_prefill_and_decode(model, tok: AutoTokenizer, device: str,
         next_ids = out.logits[:, -1:, :].argmax(dim=-1)
 
     decode_ms = t_dec * 1000.0 / max(1, decode_tokens)
-    decode_peak_abs = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        decode_peak_abs = torch.cuda.max_memory_allocated() / 1024**2
+    else:
+        decode_peak_abs = 0.0
     decode_peak_delta = max(0.0, decode_peak_abs - decode_start_alloc)
     storage_after = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
 
@@ -781,10 +993,10 @@ if __name__ == "__main__":
     SEQ_LEN    = int(os.getenv("SEQ_LEN", "512"))
     MAX_EVAL_SAMPLES = int(os.getenv("MAX_EVAL_SAMPLES", "64"))
     # SVD ranks (per-head for Q/K/V, whole-matrix for O/FF)
-    RANK_Q  = int(os.getenv("RANK_Q",  "128"))
-    RANK_KV = int(os.getenv("RANK_KV", "128"))
-    RANK_O  = int(os.getenv("RANK_O",  "0")) or None
-    RANK_FF = int(os.getenv("RANK_FF", "0")) or None
+    RANK_Q  = int(os.getenv("RANK_Q",  "32"))
+    RANK_KV = int(os.getenv("RANK_KV", "32"))
+    RANK_O  = int(os.getenv("RANK_O",  "1024")) or None
+    RANK_FF = int(os.getenv("RANK_FF", "1024")) or None
     SVD_DTYPE = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[os.getenv("SVD_DTYPE", "fp32").lower()]
     SVD_COMPUTE_FP32 = os.getenv("SVD_COMPUTE_FP32", "1") == "1"
     EVAL_CONTIGUOUS = os.getenv("EVAL_CONTIGUOUS", "1") == "1"
@@ -888,8 +1100,8 @@ DTYPE=float16 \
 MODE=decode \
 PROMPT_BATCH=16 \
 MAX_GEN_TOKENS=128 \
-RANK_KV=128 \
-SVD_DTYPE=bf16 \
+RANK_KV=32 \
+SVD_DTYPE=fp16 \
 DEBUG_CACHE=1 \
 python profile_asvd_flashsvd_llama.py
 """

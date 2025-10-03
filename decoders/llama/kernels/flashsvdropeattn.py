@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from flash_attn_causal import flash_attn_triton
+
 
 # ----------------------------
 # Utilities
@@ -517,15 +519,79 @@ def _reference_sdpa_with_rope_bmhd(Pq, Pk, Pv, Vq, Vk, Vv, bq, bk, bv, cos_bmhd,
     return Oref
 
 
-if __name__ == "__main__":
-    import argparse, time
+@torch.no_grad()
+def _reference_flashattn_with_rope_bmhd(
+    Pq, Pk, Pv,
+    Vq, Vk, Vv,
+    bq, bk, bv,
+    cos_bmhd, sin_bmhd,
+    attention_mask_2d=None,
+):
+    """
+    FlashAttention-based reference in BMHd layout (causal + padding).
+    - Applies RoPE to Q,K, then calls causal Triton FlashAttention.
+    - Returns output in BMHd: [B, M, H, dh]
+    Inputs:
+      Pq,Pk,Pv: [B,M,R]
+      Vq,Vk,Vv: [R, H*dh]
+      b?:       [H*dh] or None
+      cos/sin:  [B, M, H, dh]
+      attention_mask_2d: [B,M] 1/0 or bool, True/1 = valid token
+    """
+    B, M, R = Pq.shape
+    H = cos_bmhd.shape[2]
+    Hdh = Vq.shape[1]
+    dh = Hdh // H
+    device = Pq.device
 
-    parser = argparse.ArgumentParser("FlashSVD+RoPE kernel test (BMHd)")
-    parser.add_argument("--B", type=int, default=2)
+    # Build full Q,K,V in head space and add biases
+    Q = torch.matmul(Pq, Vq)
+    K = torch.matmul(Pk, Vk)
+    V = torch.matmul(Pv, Vv)
+    if bq is not None: Q = Q + bq
+    if bk is not None: K = K + bk
+    if bv is not None: V = V + bv
+
+    Q = Q.view(B, M, H, dh)
+    K = K.view(B, M, H, dh)
+    V = V.view(B, M, H, dh)
+
+    # Apply RoPE to Q,K
+    def apply_rotary_bmhd(x_bmhd, cos_bmhd, sin_bmhd):
+        x1, x2 = x_bmhd.chunk(2, dim=-1)
+        return torch.cat([x1 * cos_bmhd[..., :x1.shape[-1]] - x2 * sin_bmhd[..., :x1.shape[-1]],
+                          x1 * sin_bmhd[..., :x1.shape[-1]] + x2 * cos_bmhd[..., :x1.shape[-1]]], dim=-1)
+
+    Qr = apply_rotary_bmhd(Q, cos_bmhd, sin_bmhd)
+    Kr = apply_rotary_bmhd(K, cos_bmhd, sin_bmhd)
+
+    # Convert to [B,H,M,dh]
+    Q_bhmd = Qr.permute(0, 2, 1, 3).contiguous()
+    K_bhmd = Kr.permute(0, 2, 1, 3).contiguous()
+    V_bhmd = V.permute(0, 2, 1, 3).contiguous()
+
+    # Build [B,H,1,M] padding mask (True=valid)
+    if attention_mask_2d is None:
+        mask_bh1m = torch.ones(B, H, 1, M, device=device, dtype=torch.bool)
+    else:
+        am = attention_mask_2d.to(torch.bool)  # [B,M]
+        mask_bh1m = am[:, None, None, :].expand(B, H, 1, M).contiguous()
+
+    # Causal FlashAttention
+    O_bhmd = flash_attn_triton(Q_bhmd, K_bhmd, V_bhmd, mask_bh1m, BLOCK_M=32)  # [B,H,M,dh]
+
+    # Back to BMHd
+    return O_bhmd.permute(0, 2, 1, 3).contiguous()
+
+if __name__ == "__main__":
+    import argparse, time, gc
+
+    parser = argparse.ArgumentParser("FlashSVD+RoPE kernel test (BMHd) — clean main")
+    parser.add_argument("--B", type=int, default=8)
     parser.add_argument("--H", type=int, default=16)
     parser.add_argument("--M", type=int, default=1024)
     parser.add_argument("--dh", type=int, default=128)
-    parser.add_argument("--R", type=int, default=32, help="rank-space dimension")
+    parser.add_argument("--R", type=int, default=128, help="rank-space dimension")
     parser.add_argument("--bm", type=int, default=64)
     parser.add_argument("--bn", type=int, default=64)
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16","bf16","fp32"])
@@ -545,7 +611,33 @@ if __name__ == "__main__":
     B, H, M, dh, R = args.B, args.H, args.M, args.dh, args.R
     D = H * dh
 
-    # Rank-space activations and factors
+    # -------- helpers --------
+    def bytes_to_mb(x): return x / (1024**2)
+    def mb(x): return f"{x/(1024**2):.1f} MB"
+
+    def isolated_peak(fn, *a, **k):
+        """Run fn(*a, **k) with a clean allocator view and return (out, peak_alloc, peak_reserved)."""
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        out = fn(*a, **k)
+        torch.cuda.synchronize()
+        return out, torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+
+    def measure_latency(callable_fn, iters):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(max(1, iters)):
+            _ = callable_fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) * 1000.0 / max(1, iters)
+
+    def _pretty_mem_current(tag=""):
+        print(f"{tag}baseline now: alloc={mb(torch.cuda.memory_allocated())}, "
+              f"reserved={mb(torch.cuda.memory_reserved())}")
+
+    # -------- random test tensors --------
     Pq = torch.randn(B, M, R, device=device, dtype=dtype)
     Pk = torch.randn(B, M, R, device=device, dtype=dtype)
     Pv = torch.randn(B, M, R, device=device, dtype=dtype)
@@ -562,12 +654,12 @@ if __name__ == "__main__":
     position_ids = torch.arange(M, device=device)[None, :].expand(B, -1)
     rotary = _SimpleRotary(base=10000.0)
 
-    # Make BMHd cos/sin for reference
+    # Make BMHd cos/sin for references (kernel builds its own internally)
     dummy = torch.empty((B * H, M, dh), device=device, dtype=dtype)
     posf = position_ids.unsqueeze(1).expand(B, H, M).reshape(B * H, M)
-    cos, sin = rotary(dummy, position_ids=posf)
-    cos_bmhd = cos.view(B, H, M, dh).permute(0, 2, 1, 3).contiguous()
-    sin_bmhd = sin.view(B, H, M, dh).permute(0, 2, 1, 3).contiguous()
+    cos, sin = rotary(dummy, position_ids=posf)                       # [(B*H), M, dh]
+    cos_bmhd = cos.view(B, H, M, dh).permute(0, 2, 1, 3)              # [B, M, H, dh]
+    sin_bmhd = sin.view(B, H, M, dh).permute(0, 2, 1, 3)
 
     # Optional 2D padding mask
     attention_mask = None
@@ -577,92 +669,31 @@ if __name__ == "__main__":
         attention_mask[:, :valid_len] = 1
 
     # Kernel wrapper
-    torch.cuda.synchronize()
-    flash = FlashSVDRoPEAttention(num_heads=H, head_dim=dh, rotary_emb=rotary, bm=args.bm, bn=args.bn, bdh=dh).to(device)
+    flash = FlashSVDRoPEAttention(
+        num_heads=H, head_dim=dh, rotary_emb=rotary,
+        bm=args.bm, bn=args.bn, bdh=dh
+    ).to(device)
 
     qkv = QKVFactors(Pq=Pq, Pk=Pk, Pv=Pv, Vq=Vq, Vk=Vk, Vv=Vv, bq=bq, bk=bk, bv=bv)
 
-    # Warmup
+    # -------- Warmup the kernel only (kept small and separate) --------
     for _ in range(max(1, args.warmup)):
         _ = flash(qkv, attention_mask=attention_mask, position_ids=position_ids)
     torch.cuda.synchronize()
-
-    # Latency (kernel)
-    t0 = time.perf_counter()
-    for _ in range(args.iters):
-        O_kernel = flash(qkv, attention_mask=attention_mask, position_ids=position_ids)
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    ms_kernel = (t1 - t0) * 1000.0 / max(1, args.iters)
-
-    # Peak memory for one forward
-    torch.cuda.reset_peak_memory_stats()
-    _ = flash(qkv, attention_mask=attention_mask, position_ids=position_ids)
-    torch.cuda.synchronize()
-    peak_alloc = torch.cuda.max_memory_allocated()
-    peak_reserved = torch.cuda.max_memory_reserved()
-
-    # Reference (BMHd)
-    Pq32, Pk32, Pv32 = Pq.float(), Pk.float(), Pv.float()
-    Vq32, Vk32, Vv32 = Vq.float(), Vk.float(), Vv.float()
-    bq32, bk32, bv32 = bq.float(), bk.float(), bv.float()
-    cos32, sin32 = cos_bmhd.float(), sin_bmhd.float()
-    am32 = attention_mask if attention_mask is None else attention_mask.int()
-
-    for _ in range(3):
-        _ = _reference_sdpa_with_rope_bmhd(Pq32, Pk32, Pv32, Vq32, Vk32, Vv32, bq32, bk32, bv32, cos32, sin32, am32)
-    torch.cuda.synchronize()
-
-    t0 = time.perf_counter()
-    for _ in range(max(1, args.iters // 5)):
-        O_ref = _reference_sdpa_with_rope_bmhd(Pq32, Pk32, Pv32, Vq32, Vk32, Vv32, bq32, bk32, bv32, cos32, sin32, am32)
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    ms_ref = (t1 - t0) * 1000.0 / max(1, args.iters // 5)
-
-    # Compare
-    O_k32 = O_kernel.float()  # BMHd
-    diff = O_k32 - O_ref
-    num = torch.linalg.norm(diff.reshape(B, -1), ord='fro')
-    den = torch.linalg.norm(O_ref.reshape(B, -1), ord='fro')
-    rel_fro = (num / (den + 1e-12)).item()
-    max_abs = diff.abs().max().item()
-    finite_kernel = torch.isfinite(O_kernel).all().item()
-    finite_ref = torch.isfinite(O_ref).all().item()
-    finite_diff = torch.isfinite(diff).all().item()
-
-    def _pretty_mem(x):
-        for u in ["B","KB","MB","GB","TB"]:
-            if x < 1024: return f"{x:.0f} {u}"
-            x /= 1024.0
-        return f"{x:.0f} PB"
 
     print("===== FlashSVD+RoPE Triton Kernel Test (BMHd) =====")
     print(f"Shapes: B={B}, H={H}, M={M}, dh={dh}, R={R}, dtype={dtype}")
     if attention_mask is not None:
         valid_len = int(attention_mask[0].sum().item())
         print(f"Pad mask enabled: valid_len={valid_len}/{M}")
-    print(f"Finite(kernel): {finite_kernel}  Finite(ref): {finite_ref}  Finite(diff): {finite_diff}")
-    print(f"Max abs error: {max_abs:.3e}")
-    print(f"Rel Fro error: {rel_fro:.3e}")
-    print(f"Latency (kernel): {ms_kernel:.3f} ms/iter over {args.iters} iters")
-    print(f"Latency (reference): {ms_ref:.3f} ms/iter over {max(1, args.iters//5)} iters")
-    print(f"Peak CUDA allocated: {_pretty_mem(peak_alloc)}   reserved: {_pretty_mem(peak_reserved)}")
 
-    # Peak comparison helper
-    def measure_peak_bytes(fn, *a, **k):
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        out = fn(*a, **k)
-        torch.cuda.synchronize()
-        return out, torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
-
-    def bytes_to_mb(x): return x / (1024**2)
-
-    _, kern_alloc, kern_res = measure_peak_bytes(
+    # -------- Peak memory comparison (ISOLATED) --------
+    # 1) FlashSVD kernel (measured first, clean allocator)
+    _, kern_alloc, kern_res = isolated_peak(
         flash, qkv, attention_mask=attention_mask, position_ids=position_ids
     )
 
+    # 2) Dense SDPA reference
     def run_ref():
         return _reference_sdpa_with_rope_bmhd(
             Pq.float(), Pk.float(), Pv.float(),
@@ -671,12 +702,93 @@ if __name__ == "__main__":
             cos_bmhd.float(), sin_bmhd.float(),
             attention_mask if attention_mask is None else attention_mask.int()
         )
+    _, ref_alloc, ref_res = isolated_peak(run_ref)
 
-    torch.cuda.empty_cache()
-    _, ref_alloc, ref_res = measure_peak_bytes(run_ref)
+    # 3) FlashAttention reference
+    def run_ref_fa():
+        return _reference_flashattn_with_rope_bmhd(
+            Pq.float(), Pk.float(), Pv.float(),
+            Vq.float(), Vk.float(), Vv.float(),
+            bq.float(), bk.float(), bv.float(),
+            cos_bmhd.float(), sin_bmhd.float(),
+            attention_mask if attention_mask is None else attention_mask.int()
+        )
+    _, ref_fa_alloc, ref_fa_res = isolated_peak(run_ref_fa)
 
-    print(f"\n--- Peak memory comparison ---")
+    print("\n--- Peak memory comparison (isolated) ---")
     print(f"Kernel  peak allocated: {bytes_to_mb(kern_alloc):.1f} MB   reserved: {bytes_to_mb(kern_res):.1f} MB")
     print(f"Ref SDPA peak allocated: {bytes_to_mb(ref_alloc):.1f} MB   reserved: {bytes_to_mb(ref_res):.1f} MB")
+    print(f"Ref FA   peak allocated: {bytes_to_mb(ref_fa_alloc):.1f} MB   reserved: {bytes_to_mb(ref_fa_res):.1f} MB")
     print(f"Savings (alloc): {bytes_to_mb(ref_alloc - kern_alloc):.1f} MB")
     print(f"Savings (reserv): {bytes_to_mb(ref_res  - kern_res ):.1f} MB")
+
+    # -------- Latency (measured after peaks to avoid polluting them) --------
+    ms_kernel = measure_latency(
+        lambda: flash(qkv, attention_mask=attention_mask, position_ids=position_ids),
+        args.iters
+    )
+    ms_ref = measure_latency(
+        lambda: _reference_sdpa_with_rope_bmhd(
+            Pq.float(), Pk.float(), Pv.float(),
+            Vq.float(), Vk.float(), Vv.float(),
+            bq.float(), bk.float(), bv.float(),
+            cos_bmhd.float(), sin_bmhd.float(),
+            attention_mask if attention_mask is None else attention_mask.int()
+        ),
+        max(1, args.iters // 5)
+    )
+    ms_ref_fa = measure_latency(
+        lambda: _reference_flashattn_with_rope_bmhd(
+            Pq.float(), Pk.float(), Pv.float(),
+            Vq.float(), Vk.float(), Vv.float(),
+            bq.float(), bk.float(), bv.float(),
+            cos_bmhd.float(), sin_bmhd.float(),
+            attention_mask if attention_mask is None else attention_mask.int()
+        ),
+        max(1, args.iters // 5)
+    )
+
+    print(f"\nLatency (kernel): {ms_kernel:.3f} ms/iter over {args.iters} iters")
+    print(f"Latency (reference): {ms_ref:.3f} ms/iter over {max(1, args.iters//5)} iters")
+    print(f"Latency (FA reference): {ms_ref_fa:.3f} ms/iter over {max(1, args.iters//5)} iters")
+
+    # -------- Accuracy checks (computed last; these create large temporaries) --------
+    O_kernel = flash(qkv, attention_mask=attention_mask, position_ids=position_ids).float()
+
+    O_ref = _reference_sdpa_with_rope_bmhd(
+        Pq.float(), Pk.float(), Pv.float(),
+        Vq.float(), Vk.float(), Vv.float(),
+        bq.float(), bk.float(), bv.float(),
+        cos_bmhd.float(), sin_bmhd.float(),
+        attention_mask if attention_mask is None else attention_mask.int()
+    )
+
+    O_ref_fa = _reference_flashattn_with_rope_bmhd(
+        Pq.float(), Pk.float(), Pv.float(),
+        Vq.float(), Vk.float(), Vv.float(),
+        bq.float(), bk.float(), bv.float(),
+        cos_bmhd.float(), sin_bmhd.float(),
+        attention_mask if attention_mask is None else attention_mask.int()
+    )
+
+    diff = O_kernel - O_ref
+    num = torch.linalg.norm(diff.reshape(B, -1), ord='fro')
+    den = torch.linalg.norm(O_ref.reshape(B, -1), ord='fro')
+    rel_fro = (num / (den + 1e-12)).item()
+    max_abs = diff.abs().max().item()
+
+    diff_fa = O_kernel - O_ref_fa
+    num_fa = torch.linalg.norm(diff_fa.reshape(B, -1), ord='fro')
+    den_fa = torch.linalg.norm(O_ref_fa.reshape(B, -1), ord='fro')
+    rel_fro_fa = (num_fa / (den_fa + 1e-12)).item()
+    max_abs_fa = diff_fa.abs().max().item()
+
+    finite_kernel = torch.isfinite(O_kernel).all().item()
+    finite_ref = torch.isfinite(O_ref).all().item()
+    finite_diff = torch.isfinite(diff).all().item()
+
+    print(f"\nFinite(kernel): {finite_kernel}  Finite(ref): {finite_ref}  Finite(diff): {finite_diff}")
+    print(f"Max abs error: {max_abs:.3e}")
+    print(f"Rel Fro error: {rel_fro:.3e}")
+    print(f"Max abs error vs FA-ref: {max_abs_fa:.3e}")
+    print(f"Rel Fro error vs FA-ref: {rel_fro_fa:.3e}")
