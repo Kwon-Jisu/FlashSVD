@@ -31,11 +31,14 @@ def apply_rotary_bmhd(x_bmhd: torch.Tensor, cos_bmhd: torch.Tensor, sin_bmhd: to
 # ----------------------------
 @dataclass
 class QKVFactors:
-    # Rank-space inputs [B, M, R]
+    # Rank-space inputs
+    #   Pq: [B, H, M, R]
+    #   Pk,Pv: [B, Hk, M, R] (Hk may equal H)
     Pq: torch.Tensor
     Pk: torch.Tensor
     Pv: torch.Tensor
-    # Factors to lift back to head-space [R, H*dh]
+    # Factors per head to lift back to head-space
+    #   V*: [H|Hk, R, dh]
     Vq: torch.Tensor
     Vk: torch.Tensor
     Vv: torch.Tensor
@@ -52,13 +55,13 @@ class QKVFactors:
 # ----------------------------
 @triton.jit
 def flashsvd_rope_sdpa(
-    # Pq,Pk,Pv rank-space activations [B, M, R]
+    # Pq: [B, H, M, R]; Pk,Pv: [B, Hk, M, R]
     Pq_ptr, Pk_ptr, Pv_ptr,
-    # Vq,Vk,Vv factors [R, H*dh]
+    # Vq: [H, R, dh]; Vk,Vv: [Hk, R, dh]
     Vq_ptr, Vk_ptr, Vv_ptr,
     # Optional biases over H*dh (0-stride if absent)
     bq_ptr, bk_ptr, bv_ptr,
-    # RoPE cos/sin [B, M, H, dh] (BMHd)
+    # RoPE cos/sin [B, M, dh] (BMd) — head-shared
     COS_ptr, SIN_ptr,
     # Output pointer O [B, M, H, dh] (BMHd)
     O_ptr,
@@ -66,23 +69,23 @@ def flashsvd_rope_sdpa(
     pad_mask_ptr,   # [B, M] (1 valid, 0 pad) or nullptr
     add_mask_ptr,   # [B, 1, M, M] additive or nullptr
     # Shapes / strides
-    B, H, M, R, dh,
-    sPq_b, sPq_m, sPq_r,
-    sPk_b, sPk_m, sPk_r,
-    sPv_b, sPv_m, sPv_r,
-    sVq_r, sVq_hd,
-    sVk_r, sVk_hd,
-    sVv_r, sVv_hd,
+    B, H, Hk, M, R, dh,
+    sPq_b, sPq_h, sPq_m, sPq_r,
+    sPk_b, sPk_h, sPk_m, sPk_r,
+    sPv_b, sPv_h, sPv_m, sPv_r,
+    sVq_h, sVq_r, sVq_dh,
+    sVk_h, sVk_r, sVk_dh,
+    sVv_h, sVv_r, sVv_dh,
     sbq_hd, sbk_hd, sbv_hd,
-    sCOS_b, sCOS_m, sCOS_h, sCOS_dh,   # NOTE: BMHd order for cos/sin
-    sSIN_b, sSIN_m, sSIN_h, sSIN_dh,
+    sCOS_b, sCOS_m, sCOS_dh,           # NOTE: BMd order for cos/sin
+    sSIN_b, sSIN_m, sSIN_dh,
     sO_b, sO_m, sO_h, sO_dh,           # NOTE: BMHd order for output
     sPM_b, sPM_m,
     sAM_b, sAM_mq, sAM_mk,             # additive mask [B, 1, Mq, Mk]
     # Tiling
     BM: tl.constexpr, BN: tl.constexpr, BDH: tl.constexpr, BR: tl.constexpr,
     # flags
-    HAS_PAD: tl.constexpr, HAS_ADD: tl.constexpr,
+    HAS_PAD: tl.constexpr, HAS_ADD: tl.constexpr, CAUSAL: tl.constexpr,
 ):
     # program ids: one (B, H) head per program across M-tiles
     bh   = tl.program_id(0)   # 0..B*H-1
@@ -93,7 +96,9 @@ def flashsvd_rope_sdpa(
     # tile offsets (queries)
     offs_m = m_blk * BM + tl.arange(0, BM)
     offs_d = tl.arange(0, BDH)
-    head_offset = hid * dh
+    # group head index for KV (handles MQA/GQA)
+    rep = H // Hk
+    hid_k = hid // rep
 
     # running softmax state per (BM, dh)
     m_i = tl.full((BM,), -float("inf"), dtype=tl.float32)
@@ -117,14 +122,14 @@ def flashsvd_rope_sdpa(
             offs0 = tl.arange(0, BDH // 2)
             offs1 = offs0 + (BDH // 2)
 
-            # Load RoPE angles for queries/keys from BMHd layout
-            cos_q0 = tl.load(COS_ptr + bid*sCOS_b + offs_m[:,None]*sCOS_m + hid*sCOS_h + offs0[None,:]*sCOS_dh,
+            # Load RoPE angles for queries/keys from BMd layout (head-shared)
+            cos_q0 = tl.load(COS_ptr + bid*sCOS_b + offs_m[:,None]*sCOS_m + offs0[None,:]*sCOS_dh,
                              mask=(offs_m[:,None] < M), other=0.0)
-            sin_q0 = tl.load(SIN_ptr + bid*sSIN_b + offs_m[:,None]*sSIN_m + hid*sSIN_h + offs0[None,:]*sSIN_dh,
+            sin_q0 = tl.load(SIN_ptr + bid*sSIN_b + offs_m[:,None]*sSIN_m + offs0[None,:]*sSIN_dh,
                              mask=(offs_m[:,None] < M), other=0.0)
-            cos_k0 = tl.load(COS_ptr + bid*sCOS_b + offs_n[:,None]*sCOS_m + hid*sCOS_h + offs0[None,:]*sCOS_dh,
+            cos_k0 = tl.load(COS_ptr + bid*sCOS_b + offs_n[:,None]*sCOS_m + offs0[None,:]*sCOS_dh,
                              mask=(offs_n[:,None] < M), other=0.0)
-            sin_k0 = tl.load(SIN_ptr + bid*sSIN_b + offs_n[:,None]*sSIN_m + hid*sSIN_h + offs0[None,:]*sSIN_dh,
+            sin_k0 = tl.load(SIN_ptr + bid*sSIN_b + offs_n[:,None]*sSIN_m + offs0[None,:]*sSIN_dh,
                              mask=(offs_n[:,None] < M), other=0.0)
 
             # q/k halves (fp32)
@@ -138,32 +143,32 @@ def flashsvd_rope_sdpa(
                 r = r0 + tl.arange(0, BR)
                 mask_r = r < R
 
-                Pq_blk = tl.load(Pq_ptr + bid*sPq_b + offs_m[:,None]*sPq_m + r[None,:]*sPq_r,
+                Pq_blk = tl.load(Pq_ptr + bid*sPq_b + hid*sPq_h + offs_m[:,None]*sPq_m + r[None,:]*sPq_r,
                                  mask=(offs_m[:,None] < M) & mask_r[None,:], other=0.0)
-                Pk_blk = tl.load(Pk_ptr + bid*sPk_b + offs_n[:,None]*sPk_m + r[None,:]*sPk_r,
+                Pk_blk = tl.load(Pk_ptr + bid*sPk_b + hid_k*sPk_h + offs_n[:,None]*sPk_m + r[None,:]*sPk_r,
                                  mask=(offs_n[:,None] < M) & mask_r[None,:], other=0.0)
 
-                Vq0 = tl.load(Vq_ptr + r[:,None]*sVq_r + (head_offset + offs0)[None,:]*sVq_hd,
+                Vq0 = tl.load(Vq_ptr + hid*sVq_h + r[:,None]*sVq_r + offs0[None,:]*sVq_dh,
                               mask=mask_r[:,None], other=0.0)
-                Vq1 = tl.load(Vq_ptr + r[:,None]*sVq_r + (head_offset + offs1)[None,:]*sVq_hd,
+                Vq1 = tl.load(Vq_ptr + hid*sVq_h + r[:,None]*sVq_r + offs1[None,:]*sVq_dh,
                               mask=mask_r[:,None], other=0.0)
                 q0 += tl.dot(Pq_blk, Vq0.to(Pq_blk.dtype)).to(tl.float32)
                 q1 += tl.dot(Pq_blk, Vq1.to(Pq_blk.dtype)).to(tl.float32)
 
-                Vk0 = tl.load(Vk_ptr + r[:,None]*sVk_r + (head_offset + offs0)[None,:]*sVk_hd,
+                Vk0 = tl.load(Vk_ptr + hid_k*sVk_h + r[:,None]*sVk_r + offs0[None,:]*sVk_dh,
                               mask=mask_r[:,None], other=0.0)
-                Vk1 = tl.load(Vk_ptr + r[:,None]*sVk_r + (head_offset + offs1)[None,:]*sVk_hd,
+                Vk1 = tl.load(Vk_ptr + hid_k*sVk_h + r[:,None]*sVk_r + offs1[None,:]*sVk_dh,
                               mask=mask_r[:,None], other=0.0)
                 k0 += tl.dot(Pk_blk, Vk0.to(Pk_blk.dtype)).to(tl.float32)
                 k1 += tl.dot(Pk_blk, Vk1.to(Pk_blk.dtype)).to(tl.float32)
 
             if sbq_hd != 0:
-                bq0 = tl.load(bq_ptr + (head_offset + offs0) * sbq_hd)
-                bq1 = tl.load(bq_ptr + (head_offset + offs1) * sbq_hd)
+                bq0 = tl.load(bq_ptr + (hid*dh + offs0) * sbq_hd)
+                bq1 = tl.load(bq_ptr + (hid*dh + offs1) * sbq_hd)
                 q0 += bq0[None, :]; q1 += bq1[None, :]
             if sbk_hd != 0:
-                bk0 = tl.load(bk_ptr + (head_offset + offs0) * sbk_hd)
-                bk1 = tl.load(bk_ptr + (head_offset + offs1) * sbk_hd)
+                bk0 = tl.load(bk_ptr + (hid*dh + offs0) * sbk_hd)
+                bk1 = tl.load(bk_ptr + (hid*dh + offs1) * sbk_hd)
                 k0 += bk0[None, :]; k1 += bk1[None, :]
 
             # RoPE rotate halves using first-half angles
@@ -174,6 +179,11 @@ def flashsvd_rope_sdpa(
 
             scores += tl.dot(q0r, tl.trans(k0r))
             scores += tl.dot(q1r, tl.trans(k1r))
+
+        # apply causal mask if requested (triangular: allow n <= m)
+        if CAUSAL:
+            causal = offs_n[None, :] <= offs_m[:, None]
+            scores = tl.where(causal, scores, -float("inf"))
 
         # scale
         scores *= scale
@@ -202,14 +212,14 @@ def flashsvd_rope_sdpa(
             for r0 in range(0, R, BR):
                 r = r0 + tl.arange(0, BR)
                 mask_r = r < R
-                Pv_blk = tl.load(Pv_ptr + bid*sPv_b + offs_n[:,None]*sPv_m + r[None,:]*sPv_r,
+                Pv_blk = tl.load(Pv_ptr + bid*sPv_b + hid_k*sPv_h + offs_n[:,None]*sPv_m + r[None,:]*sPv_r,
                                  mask=(offs_n[:,None] < M) & mask_r[None,:], other=0.0)
-                Vv_sub = tl.load(Vv_ptr + r[:,None]*sVv_r + (head_offset + d)[None,:]*sVv_hd,
+                Vv_sub = tl.load(Vv_ptr + hid_k*sVv_h + r[:,None]*sVv_r + d[None,:]*sVv_dh,
                                  mask=mask_r[:,None] & mask_d[None,:], other=0.0)
                 v_blk += tl.dot(Pv_blk, Vv_sub.to(Pv_blk.dtype)).to(tl.float32)
 
             if sbv_hd != 0:
-                bv_sub = tl.load(bv_ptr + (head_offset + d) * sbv_hd, mask=mask_d, other=0.0)
+                bv_sub = tl.load(bv_ptr + (hid*dh + d) * sbv_hd, mask=mask_d, other=0.0)
                 v_blk += bv_sub[None, :]
 
             if d0 == 0:
@@ -242,6 +252,8 @@ class FlashSVDRoPEAttention(nn.Module):
         self.bdh = head_dim if bdh is None else bdh
         self.br = br
         assert self.bdh == head_dim, "Kernel currently expects BDH == dh."
+        # always causal for decoder-only models
+        self.causal = True
 
     @torch.no_grad()
     def forward(
@@ -255,17 +267,43 @@ class FlashSVDRoPEAttention(nn.Module):
         Vq, Vk, Vv = qkv_factors.Vq, qkv_factors.Vk, qkv_factors.Vv
         bq, bk, bv = qkv_factors.bq, qkv_factors.bk, qkv_factors.bv
 
-        B, M, R = Pq.shape
         H, dh = self.num_heads, self.head_dim
+        # Expect Pq [B,H,M,R], Pk/Pv [B,Hk,M,R], Vq [H,R,dh], Vk/Vv [Hk,R,dh]
+        if Pq.dim() != 4:
+            raise ValueError(f"FlashSVDRoPEAttention expects Pq [B,H,M,R], got {tuple(Pq.shape)}")
+        B, Hq, M, R = Pq.shape
+        if Hq != H:
+            raise ValueError(f"Pq has {Hq} heads, expected {H}")
+        if Pk.dim() != 4 or Pv.dim() != 4:
+            raise ValueError(f"Expected Pk/Pv [B,Hk,M,R], got {tuple(Pk.shape)}/{tuple(Pv.shape)}")
+        Bk, Hk, Mk, Rk = Pk.shape
+        assert Bk == B and Mk == M and Rk == R, "Pk shape mismatch vs Pq"
+        device = Pq.device
+        dtype = Pq.dtype
         device = Pq.device
         dtype = Pq.dtype
 
-        # ---- RoPE cos/sin as BMHd (convert once) ----
-        dummy = torch.empty((B * H, M, dh), device=device, dtype=dtype)
-        posf = position_ids.unsqueeze(1).expand(B, H, M).reshape(B * H, M)
-        cos, sin = self.rotary_emb(dummy, position_ids=posf)  # [(B*H), M, dh]
-        cos = cos.view(B, H, M, dh).permute(0, 2, 1, 3).contiguous()  # [B, M, H, dh]
-        sin = sin.view(B, H, M, dh).permute(0, 2, 1, 3).contiguous()  # [B, M, H, dh]
+        # ---- RoPE cos/sin as BMd (head-shared) ----
+        # Prefer using rotary_emb.inv_freq if available to avoid building BH copies.
+        def _build_cos_sin_bmd(B, M, dh, position_ids, device, dtype):
+            try:
+                inv = getattr(self.rotary_emb, 'inv_freq')
+                inv = inv.to(device=device, dtype=torch.float32)
+                pos = position_ids.to(torch.float32)[..., None]
+                ang = pos * inv  # [B, M, dh/2]
+                cos_h = torch.cos(ang)
+                sin_h = torch.sin(ang)
+                cos = torch.stack((cos_h, cos_h), dim=-1).reshape(B, M, dh).to(dtype)
+                sin = torch.stack((sin_h, sin_h), dim=-1).reshape(B, M, dh).to(dtype)
+                return cos.contiguous(), sin.contiguous()
+            except Exception:
+                # Fallback: call rotary_emb with BH then collapse to BMd by taking any head (identical across heads)
+                dummy = torch.empty((B, M, dh), device=device, dtype=dtype)
+                posf = position_ids
+                cos1, sin1 = self.rotary_emb(dummy, position_ids=posf)  # [B, M, dh]
+                return cos1.contiguous(), sin1.contiguous()
+
+        cos, sin = _build_cos_sin_bmd(B, M, dh, position_ids, device, dtype)
 
         # ---- masks ----
         pad_mask_ptr = None
@@ -293,19 +331,19 @@ class FlashSVDRoPEAttention(nn.Module):
         O = torch.empty((B, M, H, dh), device=device, dtype=dtype)
 
         # Strides for rank-space and factors
-        sPq_b, sPq_m, sPq_r = Pq.stride()
-        sPk_b, sPk_m, sPk_r = Pk.stride()
-        sPv_b, sPv_m, sPv_r = Pv.stride()
-        sVq_r, sVq_hd = Vq.stride()
-        sVk_r, sVk_hd = Vk.stride()
-        sVv_r, sVv_hd = Vv.stride()
+        sPq_b, sPq_h, sPq_m, sPq_r = Pq.stride()
+        sPk_b, sPk_h, sPk_m, sPk_r = Pk.stride()
+        sPv_b, sPv_h, sPv_m, sPv_r = Pv.stride()
+        sVq_h, sVq_r, sVq_dh = Vq.stride()
+        sVk_h, sVk_r, sVk_dh = Vk.stride()
+        sVv_h, sVv_r, sVv_dh = Vv.stride()
         sbq_hd = bq.stride(0) if bq is not None else 0
         sbk_hd = bk.stride(0) if bk is not None else 0
         sbv_hd = bv.stride(0) if bv is not None else 0
 
         # BMHd strides (note the order we’ll pass to kernel)
-        sCOS_b, sCOS_m, sCOS_h, sCOS_dh = cos.stride()
-        sSIN_b, sSIN_m, sSIN_h, sSIN_dh = sin.stride()
+        sCOS_b, sCOS_m, sCOS_dh = cos.stride()
+        sSIN_b, sSIN_m, sSIN_dh = sin.stride()
         sO_b,   sO_m,   sO_h,   sO_dh   = O.stride()
 
         if has_pad:
@@ -329,21 +367,21 @@ class FlashSVDRoPEAttention(nn.Module):
             O,
             pad_mask_ptr if has_pad else O,
             add_mask_ptr if has_add else O,
-            B, H, M, R, dh,
-            sPq_b, sPq_m, sPq_r,
-            sPk_b, sPk_m, sPk_r,
-            sPv_b, sPv_m, sPv_r,
-            sVq_r, sVq_hd,
-            sVk_r, sVk_hd,
-            sVv_r, sVv_hd,
+            B, H, Hk, M, R, dh,
+            sPq_b, sPq_h, sPq_m, sPq_r,
+            sPk_b, sPk_h, sPk_m, sPk_r,
+            sPv_b, sPv_h, sPv_m, sPv_r,
+            sVq_h, sVq_r, sVq_dh,
+            sVk_h, sVk_r, sVk_dh,
+            sVv_h, sVv_r, sVv_dh,
             sbq_hd, sbk_hd, sbv_hd,
-            sCOS_b, sCOS_m, sCOS_h, sCOS_dh,
-            sSIN_b, sSIN_m, sSIN_h, sSIN_dh,
+            sCOS_b, sCOS_m, sCOS_dh,
+            sSIN_b, sSIN_m, sSIN_dh,
             sO_b,   sO_m,   sO_h,   sO_dh,
             sPM_b, sPM_m,
             sAM_b, sAM_mq, sAM_mk,
             BM=self.bm, BN=self.bn, BDH=self.bdh, BR=self.br,
-            HAS_PAD=has_pad, HAS_ADD=has_add,
+            HAS_PAD=has_pad, HAS_ADD=has_add, CAUSAL=int(self.causal),
             num_warps=4, num_stages=2,
         )
         return O  # [B, M, H, dh] BMHd

@@ -527,4 +527,4 @@ if __name__ == "__main__":
     print(f"{'LLaMA+SVD':<20} | {storage_mem:<14.1f} | {peak_mem:<10.1f} | {transient_mem:<14.1f} | {kv_cache_est_mib:<10.1f} | {time_ms:<12.1f} | {ppl:<10.4f}")
 
 
-# CUDA_VISIBLE_DEVICES=3,4,5,6,7 SVD_DTYPE=fp16 SVD_COMPUTE_FP32=1 SVD_VERIFY=1 PRINT_SUMMARY=1 MAX_EVAL_SAMPLES=10 MAX_EVAL_BATCHES=5 CHUNK_SIZE=256 python profile_svd_kv_llama.py
+# CUDA_VISIBLE_DEVICES=3,4,5,6,7 SVD_DTYPE=fp16 SVD_COMPUTE_FP32=1 SVD_VERIFY=1 PRINT_SUMMARY=1 MAX_EVAL_SAMPLES=10 MAX_EVAL_BATCHES=5 CHUNK_SIZE=256 python profile_svd_llama.py
