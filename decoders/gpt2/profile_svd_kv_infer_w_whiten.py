@@ -338,6 +338,8 @@ class LowRankSVDBlock(nn.Module):
 
         self.D, self.H, self.dh = D, H, dh
         self.scale = 1.0 / math.sqrt(dh)
+        # cache for causal masks to avoid re-allocating per layer
+        self._mask_cache: Dict[Tuple[str, Optional[int], int, int], torch.Tensor] = {}
 
         dev = next(hf_layer.parameters()).device
         ptdtype = next(hf_layer.parameters()).dtype
@@ -491,8 +493,18 @@ class LowRankSVDBlock(nn.Module):
 
         attn_scores = torch.matmul(Q, K_cat.transpose(-2, -1)) * self.scale  # [B,H,S,total_len]
 
-        causal = make_causal_slice_mask(S, total_len, device=dev, dtype=torch.bool)
-        attn_scores = attn_scores.masked_fill(~causal[None, None, :, :], neg_inf)
+        # Fast causal mask: cache per (device, S, total_len)
+        key = (dev.type, dev.index, int(S), int(total_len))
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            # build [S,total_len] mask: allow j <= past_len + i
+            i = torch.arange(S, device=dev).view(S, 1)
+            j = torch.arange(total_len, device=dev).view(1, total_len)
+            past_len = total_len - S
+            causal = (j <= (past_len + i))  # [S,total_len]
+            mask = causal[None, None, :, :].contiguous()  # [1,1,S,total_len]
+            self._mask_cache[key] = mask
+        attn_scores = attn_scores.masked_fill(~mask, neg_inf)
 
         if attention_mask is not None:
             if attention_mask.dim() == 4:
@@ -565,59 +577,57 @@ def _from_bhtd_to_cache_layout(k_bhtd: torch.Tensor, v_bhtd: torch.Tensor, expec
         return k_bhtd.permute(0, 2, 1, 3).contiguous(), v_bhtd.permute(0, 2, 1, 3).contiguous()
     return k_bhtd, v_bhtd
 
+class DenseKVCache:
+    """Simple per-layer dense KV cache: stores (K,V) as [B,H,T,dh] and grows along T."""
+    def __init__(self, n_layers: int):
+        self.layers: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * n_layers
+    def get(self, i: int):
+        return self.layers[i]
+    def get_seq_length(self, i: int) -> int:
+        entry = self.layers[i]
+        return 0 if entry is None else int(entry[0].size(2))
+    @torch.no_grad()
+    def update(self, K_new: torch.Tensor, V_new: torch.Tensor, i: int):
+        assert K_new.dim() == 4 and V_new.dim() == 4
+        entry = self.layers[i]
+        if entry is None:
+            self.layers[i] = (K_new, V_new)
+        else:
+            K, V = entry
+            self.layers[i] = (torch.cat([K, K_new], dim=2), torch.cat([V, V_new], dim=2))
+
+
 class LayerShim(nn.Module):
     def __init__(self, block: nn.Module, layer_idx: int = None):
         super().__init__()
         self.block = block
         self.layer_idx = layer_idx
+        self._dense_cache: Optional[DenseKVCache] = None
 
     def forward(self, hidden_states, past_key_value=None, cache_position=None, attention_mask=None, *args, **kwargs):
+        # Ignore HF past_key_value; use internal dense KV cache for stable decode
         layer_past = None
-        expect_bthd = False
-
-        if past_key_value is not None and self.layer_idx is not None:
-            if hasattr(past_key_value, "get_seq_length"):
-                try:
-                    seq_len = past_key_value.get_seq_length(self.layer_idx)
-                except Exception:
-                    seq_len = 0
-                if seq_len and hasattr(past_key_value, "layers") and len(past_key_value.layers) > self.layer_idx:
-                    layer_cache = past_key_value.layers[self.layer_idx]
-                    k_cache = getattr(layer_cache, "keys", None)
-                    v_cache = getattr(layer_cache, "values", None)
-                    if k_cache is not None and v_cache is not None:
-                        if k_cache.dim() == 4:
-                            expect_bthd = (k_cache.size(2) == self.block.H)
-                            k_std, v_std = _ensure_bhtd(k_cache, v_cache, self.block.H)
-                            layer_past = (k_std, v_std)
-                elif seq_len and hasattr(past_key_value, "key_cache"):
-                    k_cache = past_key_value.key_cache[self.layer_idx]
-                    v_cache = past_key_value.value_cache[self.layer_idx]
-                    if k_cache is not None and v_cache is not None:
-                        expect_bthd = (k_cache.size(2) == self.block.H)
-                        k_std, v_std = _ensure_bhtd(k_cache, v_cache, self.block.H)
-                        layer_past = (k_std, v_std)
-            elif isinstance(past_key_value, (tuple, list)) and len(past_key_value) == 2:
-                layer_past = past_key_value
+        dense_cache = getattr(self, "_dense_cache", None)
+        if isinstance(dense_cache, DenseKVCache):
+            entry = dense_cache.get(self.layer_idx)
+            if entry is not None and dense_cache.get_seq_length(self.layer_idx) > 0:
+                layer_past = entry
 
         result = self.block(
             hidden_states,
             layer_past=layer_past,
             attention_mask=attention_mask,
-            **kwargs,
+            use_cache=True,
+            output_attentions=kwargs.get("output_attentions", False),
         )
 
-        if (past_key_value is not None and
-            hasattr(past_key_value, "update") and
-            self.layer_idx is not None and
+        if (isinstance(dense_cache, DenseKVCache) and
             isinstance(result, tuple) and len(result) >= 2 and
-            isinstance(result[1], tuple) and len(result[1]) == 2):
-
-            k_new_bhtd, v_new_bhtd = result[1]
-            k_upd, v_upd = _from_bhtd_to_cache_layout(k_new_bhtd, v_new_bhtd, expect_bthd)
-            past_key_value.update(k_upd, v_upd, self.layer_idx)
-
+            isinstance(result[1], (tuple, list)) and len(result[1]) == 2):
+            K_new, V_new = result[1]
+            dense_cache.update(K_new, V_new, self.layer_idx)
         return result
+
 
 # =========================
 # Builders & Validators
@@ -658,47 +668,6 @@ def build_svd_model(
         model.transformer.h[i] = shim
 
     return model
-
-@torch.no_grad()
-def compare_qkv_intermediate(dense_block: nn.Module, svd_block: LowRankSVDBlock, x: torch.Tensor):
-    D, H, dh = svd_block.D, svd_block.H, svd_block.dh
-    Wc_lin = as_linear_weight(dense_block.attn.c_attn.weight.data, in_dim=D, out_dim=3 * D)
-    bc = dense_block.attn.c_attn.bias.data.to(device=x.device, dtype=x.dtype)
-    qkv = x @ Wc_lin + bc  # [B,S,3D]
-    q, k, v = qkv.split(D, dim=-1)
-    q = q.view(x.shape[0], x.shape[1], H, dh).permute(0, 2, 1, 3).contiguous()
-    k = k.view(x.shape[0], x.shape[1], H, dh).permute(0, 2, 1, 3).contiguous()
-    v = v.view(x.shape[0], x.shape[1], H, dh).permute(0, 2, 1, 3).contiguous()
-
-    Q = torch.einsum('bsd,dhr,hre->bhse', x, svd_block.q_U, svd_block.q_V) + svd_block.q_b[None, :, None, :]
-    K = torch.einsum('bsd,dhr,hre->bhse', x, svd_block.k_U, svd_block.k_V) + svd_block.k_b[None, :, None, :]
-    V = torch.einsum('bsd,dhr,hre->bhse', x, svd_block.v_U, svd_block.v_V) + svd_block.v_b[None, :, None, :]
-
-    def stats(name, A, B):
-        md = (A - B).abs().max().item()
-        rd = (A - B).norm() / (A.norm() + 1e-12)
-        print(f"{name:>3}  max|Δ|={md:.8f}  rel={rd:.8f}")
-
-    print("=== QKV intermediate comparison ===")
-    stats("Q", Q, q)
-    stats("K", K, k)
-    stats("V", V, v)
-
-@torch.no_grad()
-def end_to_end_validation(dense: GPT2LMHeadModel, svd: GPT2LMHeadModel, device: str, use_cache: bool = False):
-    test_input_ids = torch.randint(0, 1000, (2, 16), device=device)
-    attn = torch.ones_like(test_input_ids, device=device)
-
-    o1 = dense(input_ids=test_input_ids, attention_mask=attn, use_cache=use_cache).logits
-    o2 = svd(input_ids=test_input_ids, attention_mask=attn, use_cache=use_cache).logits
-
-    max_diff = (o1 - o2).abs().max().item()
-    rel_diff = (o1 - o2).norm() / (o1.norm() + 1e-12)
-    print(f"Max absolute difference: {max_diff:.8f}")
-    print(f"Relative difference:     {rel_diff:.8f}")
-    ok = max_diff < 1e-1
-    print("✓ Validation PASSED" if ok else "✗ Validation FAILED")
-    return max_diff, rel_diff
 
 # ================================================================
 # Factor computation from whitening (block-by-block) + saving
@@ -857,202 +826,63 @@ def perplexity_peak_time(mdl: GPT2LMHeadModel, loader, device: str, use_mask: bo
     ppl = math.exp(avg_loss) if total_tokens > 0 else float("inf")
     return ppl, peak, ms_per_batch
 
-# =========================
-# User prompt generation and inference (+ memory profiling)
-# =========================
-def generate_user_prompt(tokenizer: AutoTokenizer, length: int = 256) -> str:
-    base_prompt = (
-        "The future of artificial intelligence holds tremendous promise for transforming "
-        "how we live, work, and interact with technology. As machine learning algorithms "
-        "become more sophisticated and computational power continues to grow exponentially, "
-        "we are witnessing unprecedented breakthroughs in natural language processing, "
-        "computer vision, and autonomous systems. These advances are not merely theoretical "
-        "achievements confined to research laboratories, but practical innovations that are "
-        "already reshaping industries from healthcare and finance to transportation and "
-        "entertainment. The integration of AI into everyday applications has created new "
-        "opportunities for human-machine collaboration, where artificial intelligence "
-        "augments human capabilities rather than replacing them entirely. However, this "
-        "rapid technological evolution also raises important questions about ethics, "
-        "privacy, and the societal implications of widespread AI adoption. As we navigate "
-        "this transformative period, it becomes crucial to establish frameworks that ensure "
-        "AI development remains aligned with human values and benefits society as a whole. "
-        "The challenge lies not only in advancing the technical capabilities of these "
-        "systems but also in creating governance structures that promote responsible "
-        "innovation while fostering continued progress in this revolutionary field."
-    )
-    tokens = tokenizer.encode(base_prompt)
-    if len(tokens) > length:
-        tokens = tokens[:length]
-    elif len(tokens) < length:
-        padding_text = (
-            " The implications of these developments extend far beyond the immediate "
-            "technological benefits, influencing economic structures, educational paradigms, "
-            "and social dynamics in ways that we are only beginning to understand. "
-            "Researchers and policymakers must work together to address the challenges "
-            "while maximizing the potential benefits of artificial intelligence for humanity."
-        )
-        padding_tokens = tokenizer.encode(padding_text)
-        while len(tokens) < length:
-            remaining = length - len(tokens)
-            if remaining >= len(padding_tokens):
-                tokens.extend(padding_tokens)
-            else:
-                tokens.extend(padding_tokens[:remaining])
-
-    prompt_text = tokenizer.decode(tokens, skip_special_tokens=True)
-    with open("prompt_exp.txt", "w", encoding="utf-8") as f:
-        f.write(prompt_text)
-    print(f"Generated {len(tokens)}-token prompt saved to prompt_exp.txt")
-    print(f"Prompt preview: {prompt_text[:100]}...")
-    return prompt_text
-
 @torch.no_grad()
-def inference_with_user_prompt(
-    model: GPT2LMHeadModel,
-    tokenizer: AutoTokenizer,
-    prompt_text: str,
-    generate_tokens: int,
+def perplexity_decode_cached(
+    mdl: GPT2LMHeadModel,
+    loader,
     device: str,
-) -> str:
-    print(f"\n=== User Prompt Inference ===")
-    print(f"Prompt length: {len(prompt_text.split())} words")
-    print(f"Generating {generate_tokens} additional tokens...\n")
-    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
-    prompt_length = input_ids.size(1)
-    print(f"Tokenized prompt length: {prompt_length} tokens")
-
-    model.eval()
-
-    # ---- Prefill profiling ----
+    *,
+    max_batches: Optional[int] = None,
+):
+    """
+    Compute perplexity by incremental decode using HF cache; only last-token logits each step.
+    Uses absolute position_ids per step for GPT-2.
+    Returns (ppl, ms_per_batch).
+    """
+    mdl.eval()
+    total_loss, total_tokens = 0.0, 0
     if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
-    prefill_start = time.perf_counter()
-    outputs = model(input_ids=input_ids, use_cache=True)
-    past_key_values = outputs.past_key_values
-    logits = outputs.logits
-    prefill_time = time.perf_counter() - prefill_start
-    prefill_peak = torch.cuda.max_memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
-    print(f"[PREFILLING] {prefill_time*1000:.2f} ms | peak={prefill_peak:.1f} MiB")
-
-    # ---- Decoding profiling ----
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
-    decode_start = time.perf_counter()
-    generated_tokens = []
-    current_input = input_ids
-    for i in range(generate_tokens):
-        next_token_logits = logits[:, -1, :]
-        next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-        token_text = tokenizer.decode(next_token_id[0], skip_special_tokens=True)
-        generated_tokens.append(token_text)
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"[DECODING] Token {i+1}/{generate_tokens}: '{token_text}'")
-        outputs = model(input_ids=next_token_id, past_key_values=past_key_values, use_cache=True)
-        past_key_values = outputs.past_key_values
-        logits = outputs.logits
-        current_input = torch.cat([current_input, next_token_id], dim=1)
-    decode_time = time.perf_counter() - decode_start
-    decode_peak = torch.cuda.max_memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
-    total_time = prefill_time + decode_time
-
-    complete_output = tokenizer.decode(current_input[0], skip_special_tokens=True)
-    gen_text = ''.join(generated_tokens)
-
-    kv_bytes = estimate_kv_bytes(past_key_values)
-    kv_mib = kv_bytes/(1024**2)
-    toks_per_s = generate_tokens / max(decode_time, 1e-6)
-    print(f"\n=== Performance Metrics ===")
-    print(f"Prefill: {prefill_time*1000:.2f} ms | peak={prefill_peak:.1f} MiB")
-    print(f"Decode:  {decode_time*1000:.2f} ms | peak={decode_peak:.1f} MiB | {toks_per_s:.2f} tok/s | KV≈{kv_mib:.1f} MiB")
-    print(f"Total:   {total_time*1000:.2f} ms")
-    print(f"\n=== Generated Text ===")
-    print(f"Continuation ({generate_tokens} tokens): '{gen_text}'")
-    return complete_output
-
-# =========================
-# Decoding-time KV-cache growth benchmark
-# =========================
-@torch.no_grad()
-def estimate_kv_bytes(past_key_values) -> int:
-    pkv = _to_legacy_kv(past_key_values)
-    if pkv is None:
-        return 0
-    total = 0
-    for layer_kv in pkv:
-        if not isinstance(layer_kv, (tuple, list)) or len(layer_kv) != 2 or layer_kv[0] is None:
-            continue
-        k, v = layer_kv
-        total += k.numel() * k.element_size()
-        total += v.numel() * v.element_size()
-    return total
-
-@torch.no_grad()
-def decode_once_with_cache(
-    model: GPT2LMHeadModel,
-    input_ids: torch.Tensor,
-    new_tokens: int,
-    device: str,
-    greedy: bool = True,
-) -> Dict[str, float]:
-    model.eval()
-    B = input_ids.size(0)
-
-    # Prefill
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
-    out = model(input_ids=input_ids, use_cache=True)
-    past = out.past_key_values
-    logits = out.logits
-    prefill_peak = torch.cuda.max_memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
 
-    # Decode
-    for _ in range(new_tokens):
-        next_id = logits[:, -1, :].argmax(-1, keepdim=True) if greedy else torch.multinomial(F.softmax(logits[:, -1, :], -1), 1)
-        out = model(input_ids=next_id, past_key_values=past, use_cache=True)
-        logits = out.logits
-        past = out.past_key_values
+    for b_idx, batch in enumerate(loader):
+        if max_batches is not None and b_idx >= max_batches:
+            break
+        ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        B, S = ids.shape
+
+        pos_ids_full = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+        out = None
+        # Internal dense KV cache for this batch
+        dense_cache = DenseKVCache(n_layers=len(mdl.transformer.h))
+        # Attach to shims
+        for lyr in mdl.transformer.h:
+            if isinstance(lyr, LayerShim):
+                setattr(lyr, "_dense_cache", dense_cache)
+        for t in range(0, S - 1):
+            inp = ids[:, t:t+1]
+            pos_step = pos_ids_full[:, t:t+1]
+            out = mdl(input_ids=inp, position_ids=pos_step, use_cache=True)
+
+            logits_last = out.logits[:, -1, :]
+            target = ids[:, t + 1]
+            m = mask[:, t + 1].bool()
+            if m.any():
+                loss = F.cross_entropy(logits_last[m], target[m])
+                total_loss += loss.item() * int(m.sum().item())
+                total_tokens += int(m.sum().item())
+
+        del out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    elap = time.perf_counter() - t0
-    decode_peak = torch.cuda.max_memory_allocated()/(1024**2) if torch.cuda.is_available() else 0.0
-
-    kv_bytes = estimate_kv_bytes(past)
-    kv_mib = kv_bytes / (1024**2)
-    toks_per_s = (B * max(new_tokens, 1)) / max(elap, 1e-6)
-
-    return {
-        "prefill_peak_MiB": prefill_peak,
-        "decode_peak_MiB": decode_peak,
-        "est_KV_MiB": kv_mib,
-        "toks_per_s": toks_per_s,
-    }
-
-@torch.no_grad()
-def decode_growth_curve(
-    model: GPT2LMHeadModel,
-    tokenizer: AutoTokenizer,
-    device: str,
-    batch_size: int,
-    prompt_len: int,
-    curve_lens: List[int],
-    label: str,
-):
-    print(f"\n=== Decoding-time KV-cache growth ({label}) ===")
-    vocab = tokenizer.vocab_size if hasattr(tokenizer, "vocab_size") else 50257
-    safe_hi = min(1000, vocab)
-    prompt = torch.randint(0, safe_hi, (batch_size, prompt_len), device=device)
-
-    header = f"{'new_T':>8} | {'prefill_peak':>12} | {'decode_peak':>11} | {'est_KV(MiB)':>12} | {'toks/s':>10}"
-    print(header); print("-" * len(header))
-    for new_T in curve_lens:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-        metrics = decode_once_with_cache(model, prompt, new_T, device)
-        print(f"{new_T:8d} | {metrics['prefill_peak_MiB']:12.1f} | {metrics['decode_peak_MiB']:11.1f} | {metrics['est_KV_MiB']:12.1f} | {metrics['toks_per_s']:10.2f}")
+    ms_per_batch = (time.perf_counter() - t0) * 1000.0 / max(1, (max_batches if max_batches is not None else len(loader)))
+    avg_loss = total_loss / max(total_tokens, 1)
+    ppl = math.exp(avg_loss) if total_tokens > 0 else float("inf")
+    return ppl, ms_per_batch
 
 # =========================
 # Main
@@ -1063,20 +893,11 @@ def main():
     parser.add_argument("--rank-ratio-mlp",  type=float, default=1.0)
     parser.add_argument("--save-factors-dir", type=str, default=None)
     parser.add_argument("--load-factors-dir", type=str, default=None)
-    parser.add_argument("--validate", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--debug-attn", action="store_true")
-    parser.add_argument("--validate-cache", action="store_true")
-
-    parser.add_argument("--decode-mem", action="store_true", help="Run decoding-time KV-cache growth benchmark")
-    parser.add_argument("--decode-curve", type=str, default="64,128,256,512", help="Comma-separated new-token lengths")
-    parser.add_argument("--decode-batch", type=int, default=1, help="Batch size for decoding benchmark")
-    parser.add_argument("--prompt-len", type=int, default=32, help="Prompt length for decoding benchmark")
-    parser.add_argument("--compare-dense", action="store_true", help="Run dense baseline in decoding benchmark too")
-    parser.add_argument("--user-prompt", action="store_true", help="Generate and use a user prompt for inference")
-    parser.add_argument("--generate-tokens", type=int, default=100, help="Number of tokens to generate after prompt")
+    parser.add_argument("--mode", type=str, choices=["prefill","decode","both"], default="both")
+    parser.add_argument("--max-eval-samples", type=int, default=None)
 
     # --- NEW: Whitening / calibration options ---
     parser.add_argument("--whiten", action="store_true", help="Run truncation-aware data whitening (SVD-LLM) and save factors")
@@ -1091,33 +912,30 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Dense baseline for comparisons
-    dense = GPT2LMHeadModel.from_pretrained("gpt2").to(device).eval()
-    for p in dense.parameters():
-        p.requires_grad = False
-    dense_mem = compute_persistent_memory(dense)
-    print(f"Dense model storage: {dense_mem:6.1f} MiB")
+    # Dense model only used for whitening (optional)
+    dense = None
 
     # ---------- Whitening path ----------
     # Autodetect existing factors in save_factors_dir if load_factors_dir is absent
     if args.whiten:
         if args.save_factors_dir is None:
             raise ValueError("--whiten requires --save-factors-dir")
-        blocks_exist = all(os.path.isfile(os.path.join(args.save_factors_dir, f"gpt2_block_{i}.pt")) for i in range(len(dense.transformer.h)))
+        tmp_dense = GPT2LMHeadModel.from_pretrained("gpt2").to(device).eval()
+        blocks_exist = all(os.path.isfile(os.path.join(args.save_factors_dir, f"gpt2_block_{i}.pt")) for i in range(len(tmp_dense.transformer.h)))
         if blocks_exist and not args.overwrite_whiten:
             print(f"[whiten] Factors already exist in {args.save_factors_dir}. Skipping recompute.")
         else:
             tok = AutoTokenizer.from_pretrained("gpt2"); tok.pad_token = tok.eos_token
-            print(f"[whiten] Collecting whitening matrices on {args.calib-dataset if hasattr(args,'calib-dataset') else args.calib_dataset}...")
+            print(f"[whiten] Collecting whitening matrices on {args.calib_dataset}...")
             S_dict = collect_whitening_mats_gpt2(
-                model=dense, tokenizer=tok, dataset_name=args.calib_dataset,
+                model=tmp_dense, tokenizer=tok, dataset_name=args.calib_dataset,
                 calib_samples=args.calib_samples, max_length=args.calib_max_length,
                 batch_size=args.batch_size, device=device, eps=args.whiten_eps,
                 save_dir=args.save_factors_dir
             )
             print("[whiten] Computing whitened low-rank factors (SVD on W S, reconstruction with Σ^{1/2} and S^{-1})...")
             compute_and_save_whitened_factors(
-                dense=dense, S_dict=S_dict, rank_ratio_attn=args.rank_ratio_attn,
+                dense=tmp_dense, S_dict=S_dict, rank_ratio_attn=args.rank_ratio_attn,
                 rank_ratio_mlp=args.rank_ratio_mlp, save_dir=args.save_factors_dir, device=device
             )
         # auto-set load dir for subsequent build
@@ -1140,46 +958,8 @@ def main():
     print(f"QKV rank: {first_blk.r_attn}, Out rank: {first_blk.r_out}")
     print(f"FC1 rank: {first_blk.r_fc1}, FC2 rank: {first_blk.r_fc2}")
 
-    if args.debug_attn:
-        blk0 = svd_model.transformer.h[0].block
-        print(f"[debug-attn] D={blk0.D}, H={blk0.H}, dh={blk0.dh}")
-
-    layer0 = dense.transformer.h[0]
-    Wc = layer0.attn.c_attn.weight; bc = layer0.attn.c_attn.bias
-    print("weight", tuple(Wc.shape), "bias", tuple(bc.shape),
-          "embed_dim", layer0.attn.embed_dim, "heads", layer0.attn.num_heads)
-
-    if args.validate:
-        print("\n=== SVD Validation ===")
-        end_to_end_validation(dense, svd_model, device=device, use_cache=False)
-        if args.validate_cache:
-            print("\n--- With KV Cache ---")
-            end_to_end_validation(dense, svd_model, device=device, use_cache=True)
-        print("\n--- Block-0 Q/K/V check ---")
-        with torch.no_grad():
-            test_ids = torch.randint(0, 1000, (2, 16), device=device)
-            wte = dense.transformer.wte(test_ids)
-            pos = torch.arange(test_ids.size(1), device=device)[None, :]
-            wpe = dense.transformer.wpe(pos)
-            h0_in = dense.transformer.drop(wte + wpe)
-            x0 = dense.transformer.h[0].ln_1(h0_in)
-            compare_qkv_intermediate(dense.transformer.h[0], svd_model.transformer.h[0].block, x0)
-        print("=== End Validation ===\n")
-
-    # User prompt mode (with profiling)
-    if args.user_prompt:
-        print("\n=== User Prompt Mode ===")
-        tok = AutoTokenizer.from_pretrained("gpt2"); tok.pad_token = tok.eos_token
-        prompt_text = generate_user_prompt(tok, length=256)
-        print("\n--- SVD Model Inference ---")
-        _ = inference_with_user_prompt(svd_model, tok, prompt_text, args.generate_tokens, device)
-        if args.compare_dense:
-            print("\n--- Dense Model Inference ---")
-            _ = inference_with_user_prompt(dense, tok, prompt_text, args.generate_tokens, device)
-        return
-
     # Perplexity eval (dataset arg now supports wikitext2 or ptb)
-    if not args.decode_mem:
+    if True:
         print("Preparing evaluation data...")
         # default: WikiText-2 test split; allow PTB via calib-dataset for symmetry
         eval_name = args.calib_dataset
@@ -1203,59 +983,27 @@ def main():
             },
         )
 
-        print("\n=== Dense baseline ===")
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
-        ppl_m, peak_m, t_m = perplexity_peak_time(dense, loader, device, use_mask=True)
-        print(f"Dense w/ mask   | ppl={ppl_m:.4f} | peak={peak_m:7.1f} MiB | {t_m:6.1f} ms/b")
-
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
-        ppl_nm, peak_nm, t_nm = perplexity_peak_time(dense, loader, device, use_mask=False)
-        print(f"Dense w/o mask  | ppl={ppl_nm:.4f} | peak={peak_nm:7.1f} MiB | {t_nm:6.1f} ms/b")
-
         print("\n=== SVD model (whitened factors if provided) ===")
         svd_mem = compute_persistent_memory(svd_model)
-        print(f"SVD model storage: {svd_mem:6.1f} MiB "
-              f"(saving {dense_mem - svd_mem:+.1f} MiB, {100*(dense_mem - svd_mem)/max(dense_mem,1e-9):.1f}%)")
+        print(f"SVD model storage: {svd_mem:6.1f} MiB")
+        if args.mode in ("prefill","both"):
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
+            ppl_m_s, peak_m_s, t_m_s = perplexity_peak_time(svd_model, loader, device, use_mask=True)
+            print(f"Prefill w/ mask | ppl={ppl_m_s:.4f} | peak={peak_m_s:7.1f} MiB | {t_m_s:6.1f} ms/b")
 
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
-        ppl_m_s, peak_m_s, t_m_s = perplexity_peak_time(svd_model, loader, device, use_mask=True)
-        print(f"SVD   w/ mask   | ppl={ppl_m_s:.4f} | peak={peak_m_s:7.1f} MiB | {t_m_s:6.1f} ms/b")
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
+            ppl_nm_s, peak_nm_s, t_nm_s = perplexity_peak_time(svd_model, loader, device, use_mask=False)
+            print(f"Prefill no mask | ppl={ppl_nm_s:.4f} | peak={peak_nm_s:7.1f} MiB | {t_nm_s:6.1f} ms/b")
 
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
-        ppl_nm_s, peak_nm_s, t_nm_s = perplexity_peak_time(svd_model, loader, device, use_mask=False)
-        print(f"SVD   w/o mask  | ppl={ppl_nm_s:.4f} | peak={peak_nm_s:7.1f} MiB | {t_nm_s:6.1f} ms/b")
-
-        print("\n=== Performance Summary ===")
-        print(f"Storage (MiB): Dense={dense_mem:.1f} | SVD={svd_mem:.1f} | Δ={dense_mem - svd_mem:+.1f} ({100*(dense_mem - svd_mem)/max(dense_mem,1e-9):.1f}%)")
-        print(f"Perplexity: dense w/={ppl_m:.4f} w/o={ppl_nm:.4f} | svd w/={ppl_m_s:.4f} w/o={ppl_nm_s:.4f}")
-        print(f"Peak (MiB): dense w/={peak_m:7.1f} w/o={peak_nm:7.1f} | svd w/={peak_m_s:7.1f} w/o={peak_nm_s:7.1f}")
-        print(f"Latency (ms/batch): dense w/={t_m:6.1f} w/o={t_nm:6.1f} | svd w/={t_m_s:6.1f} w/o={t_nm_s:6.1f}")
-
-    else:
-        tok = AutoTokenizer.from_pretrained("gpt2"); tok.pad_token = tok.eos_token
-        curve = [int(x) for x in args.decode_curve.split(",") if x.strip()]
-        bsz = args.decode_batch
-        p_len = args.prompt_len
-
-        decode_growth_curve(
-            svd_model, tok, device=device,
-            batch_size=bsz, prompt_len=p_len, curve_lens=curve, label="SVD"
-        )
-        if args.compare_dense:
-            decode_growth_curve(
-                dense, tok, device=device,
-                batch_size=bsz, prompt_len=p_len, curve_lens=curve, label="Dense"
-            )
+        if args.mode in ("decode","both"):
+            ppl_dec, t_dec = perplexity_decode_cached(svd_model, loader, device)
+            print(f"Decode (HF cache) | ppl={ppl_dec:.4f} | {t_dec:6.1f} ms/b")
+    
 
 if __name__ == "__main__":
     main()
 
 
-# python profile_svd_kv_infer_w_whiten.py --user-prompt --generate-tokens 100 --overwrite-whiten --compare-dense --rank-ratio-attn 0.9 --rank-ratio-mlp 0.9
-
-# python profile_svd_kv_infer_w_whiten.py --validate --whiten --overwrite-whiten --compare-dense --rank-ratio-attn 0.9 --rank-ratio-mlp 0.9
-
+# python3 profile_svd_kv_infer_w_whiten.py --mode decode --batch-size 2 --max-length 512 --max-eval-samples 8 --rank-ratio-attn 1.0 --rank-ratio-mlp 1.0
