@@ -2,24 +2,51 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![GitHub Stars](https://img.shields.io/github/stars/Zishan-Shao/FlashSVD?style=social)](https://github.com/Zishan-Shao/FlashSVD)
 
 This repository contains the official implementation of **FlashSVD**, a novel end-to-end rank-aware streaming inference framework specifically designed for SVD-compressed large language models. FlashSVD addresses the critical limitation of previous SVD-based compression techniques by eliminating activation memory overhead during inference.
 
 
-**Paper**: [FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models](https://arxiv.org/abs/2508.01506)
+### Support & Contact
+
+- Issues and bugs: please open a GitHub issue.
+- Feature requests (e.g., new model support or SVD methods): open an issue with details.
+- Collaboration or questions: email Zishan at zs89@duke.edu.
+
+We aim to respond promptly. This is an active, long-term project, and we welcome community contributions.
+
+**📄Paper**: [FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models](https://arxiv.org/abs/2508.01506)
+
+> 🙏 If you find FlashSVD useful in your research, we kindly ask that you `cite our paper` (see [Citation](#citation)). If this repository is helpful, please consider `starring 🌟` it to support the project — thank you!
+>
+> [![Cite FlashSVD](https://img.shields.io/badge/Cite-FlashSVD-brightgreen)](#citation) [![Star this repo](https://img.shields.io/badge/Star-This%20repo-yellow?logo=github)](https://github.com/Zishan-Shao/FlashSVD/stargazers)
 
 
-## Announcement
-Our system involves have several popular SVD method replication with code:
+## 🚀 Announcement
+Our system involves have several popular SVD method (Unofficial) replication with code:
+
+#### Encoders:
 
  - [Language model compression with weighted low-rank factorization](https://arxiv.org/abs/2207.00112): Fisher-Weighted SVD (FWSVD) is supported for BERT, RoBERTa, and ModernBERT
  - [DRONE: Data-aware Low-rank Compression for Large NLP Models](https://proceedings.neurips.cc/paper/2021/file/f56de5ef149cf0aedcc8f4797031e229-Paper.pdf): data whitening method enabled now on BERT
  - [Adaptive Rank Selections for Low-Rank Approximation of Language Models](https://aclanthology.org/2024.naacl-long.13/): AdaSVD code on BERT
 
-**TODO:** currently working on Llama, Qwen, and GPT2 in the upcoming versions. The related methods such as: ASVD, SVD-LLM, Dobi-SVD, AdaSVD will also be included in a user-friendly supports with FlashSVD for efficient inference.
+#### Decoders:
+
+- [ASVD: Activation-aware Singular Value Decomposition for Compressing Large Language Models](https://proceedings.neurips.cc/paper/2021/file/f56de5ef149cf0aedcc8f4797031e229-Paper.pdf): enabling low-rank kv-cache inference. We support asvd with uniform rank (hetero-rank case in development) on `Llama-2-7b model` and `gpt2` model
+
+### 🛠️ TODO
+- [✅] BERT (CLS / MLM) support  
+- [✅] Fisher-Weighted SVD (FWSVD) replication  
+- [✅] DRONE & Adaptive Rank Selection integration  
+- [✅] LLaMA support (ASVD)  
+- [ ] Qwen integration  
+- [ ] LLaMA, GPT-2 support (SVD-LLM, Dobi-SVD etc.)  
+- [✅] GPT-2 SVD (ASVD)  
+- [✅] Add benchmark results and visualization tools
 
 
-## Overview
+## 🔍 Overview
 
 Singular Value Decomposition (SVD) has recently seen a surge of interest as a simple yet powerful tool for large language models (LLMs) compression, with a growing number of works demonstrating 20-80% parameter reductions at minimal accuracy loss. However, previous SVD-based approaches have focused primarily on reducing the memory footprint of model weights, largely overlooking the additional activation memory overhead incurred during inference when applying truncated factors via standard dense CUDA kernels.
 
@@ -32,7 +59,7 @@ Our experiments demonstrate that this activation overhead, scaling with sequence
 The figure above illustrates the FlashSVD computation pipeline, showing the efficient flow from input through low-rank attention and feed-forward layers.
 
 
-### Key Contributions
+### 🧰 Key Contributions
 
 We introduce **FlashSVD**, a novel, end-to-end rank-aware streaming inference framework specifically designed for SVD-compressed large language models. FlashSVD can be seamlessly integrated with any model that employs SVD-based methods for parameter reduction. By fusing low-rank projection kernels directly into both the self-attention and feed-forward network (FFN) pipelines, FlashSVD avoids materializing full-size activation buffers. Instead, small tiles of the truncated factors are loaded into on-chip SRAM, multiplied and reduced on the fly, and immediately evicted, preserving high GPU occupancy and adding no extra latency.
 
@@ -41,7 +68,7 @@ We introduce **FlashSVD**, a novel, end-to-end rank-aware streaming inference fr
 - **Tile-Based Computation**: Avoids materializing full-size activation buffers
 - **Memory-Efficient Deployment**: Up to 70.2% reduction in peak activation memory
 
-## Key Features
+## 🧠 Key Features
 
 - **Universal Integration**: Seamlessly works with any SVD-compressed model
 - **Streaming Inference**: Tile-based computation avoids activation buffer materialization
@@ -49,10 +76,10 @@ We introduce **FlashSVD**, a novel, end-to-end rank-aware streaming inference fr
 - **Memory Efficient**: Up to 70.2% reduction in peak activation memory
 - **Accuracy Preserving**: No accuracy loss with upstream compression methods
 
-## Installation
+## 🧩 Installation
 
 ### Prerequisites
-
+- On Linux
 - Python 3.8 or higher
 - CUDA-compatible GPU (recommended)
 - PyTorch 1.12+ with CUDA support
@@ -61,41 +88,125 @@ We introduce **FlashSVD**, a novel, end-to-end rank-aware streaming inference fr
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/FlashSVD.git
+   git clone https://github.com/Zishan-Shao/FlashSVD.git
    cd FlashSVD
    ```
 
-2. **Install dependencies:**
+2. **Install dependencies**
+   
+   ⚠️ **You must manually install PyTorch (CPU or CUDA version) before running the script.**  
+   Example manual installation:
+
    ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-   pip install transformers datasets evaluate accelerate
-   pip install triton 
+   # CUDA 12.1
+   pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+
+   # or CPU only
+   pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
    ```
 
-3. **Install additional requirements:**
+   ### Option A — Using the provided `install_local.sh` (recommended)
+   If you just want to install the project locally with an isolated environment, 
+   run the included helper script:
+
    ```bash
-   pip install matplotlib numpy tqdm
+   # GPU mode (requires you to manually install CUDA-enabled PyTorch beforehand)
+   ./install_local.sh
+   ```
+   > 💡 **This script will:**
+   >
+   > - Create and activate a local virtual environment (`.venv`)
+   > - Upgrade `pip`
+   > - Check your existing PyTorch installation (no auto CUDA download)
+   > - Install project dependencies in editable mode (`pip install -e .`)
+   > 
+
+   ### Option B — Using Conda environment (alternative for GPU users)
+   If you prefer Conda for easier CUDA management:
+
+   ```bash
+   conda create -n flashsvd python=3.10 
+   conda activate flashsvd
+
+   # Install project dependencies
+   pip install -e .
+   ```
+   ### Option C — Manual venv setup (lightweight alternative)
+   If you want to manage everything manually without Conda or the helper script:
+   ```python
+   python3 -m venv .venv
+   source .venv/bin/activate   
+
+   # Manually install PyTorch first (choose one)
+   pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio   # CUDA 12.1
+   # Then install this project
+   pip install -e .
+
+   ```
+## ⚡ Quick Start
+
+### 1. Training BERT with FlashSVD in Gradio UI (Recommended)
+This project provides an interactive **Gradio interface** to run the unified training script easily.
+```bash
+# Launch the Gradio app 
+python app.py
+```
+   ### UI Overview
+
+   #### Mode
+   Choose `cls` (classification) or `mlm` (masked language modeling).  
+   The available tasks will automatically change depending on the selected mode.
+
+   #### Task
+   Supported GLUE tasks (e.g., `sst2`, `qnli`, `mnli`, `stsb`, etc.).
+
+   #### Model Checkpoint
+   Example — `bert-base-uncased`.
+
+   #### Training Parameters
+   - `epochs`
+   - `batch size`
+   - `learning rate`
+   - `logging steps`
+   - `evaluation steps`
+   - `random seed`
+
+   #### Advanced Options
+   - **Force CPU (`--no_cuda`)**: Force CPU training.
+   - **CUDA_VISIBLE_DEVICES**: e.g., `0` or `0,1` if multiple GPUs are available.
+   - **Extra CLI Args**: Additional command-line arguments appended at runtime.
+
+   #### Logging
+   - **Log Directory**: default `runs/`
+   - **Run Name**: leave blank to auto-generate a timestamp name.
+   - **Append if log exists**: append logs instead of overwriting.
+   - Logs are stored under `runs/<run_name>.log` and can be downloaded in the UI.
+
+   #### Internal Execution
+   Internally, the Gradio app executes a command equivalent to:
+
+   ```bash
+   python -u $TRAIN_UNIFIED_SCRIPT \
+   --mode <mode> --task <task> --model <checkpoint> \
+   --epochs <n> --batch_size <n> --learning_rate <lr> \
+   --logging_steps <n> --eval_steps <n> --seed <n> \
+   [--output_dir <path>] [--no_cuda] [<extra_args>]
    ```
 
-## Quick Start
-
-### 1. Training BERT with FlashSVD
-
+### Command Line Usage (Without UI)
 Train BERT models with specific GLUE tasks and rank configurations:
 
 ```bash
-# Train BERT on SST-2 task with custom ranks
-python train_bert.py --task sst2 --mode cls --epochs 3 --bsz 32
+python train_bert_unified_min.py \
+  --mode cls --task sst2 --model bert-base-uncased \
+  --epochs 3 --batch_size 32 --learning_rate 2e-5 \
+  --logging_steps 100 --eval_steps 0 --seed 0
 
-# Train BERT on QNLI task
-python train_bert.py --task qnli --mode cls --epochs 3 --bsz 32
-
-# Train BERT on RTE task
-python train_bert.py --task rte --mode cls --epochs 3 --bsz 32
-
-# Train RoBERTa models
-python train_roberta.py
-python train_roberta_large.py
+# Masked Language Modeling example
+python train_bert_unified_min.py \
+  --mode mlm --task mnli --model bert-base-uncased \
+  --epochs 3 --batch_size 32 --learning_rate 2e-5 \
+  --logging_steps 100 --eval_steps 0 --seed 0
 ```
 
 ### 2. Inference and Profiling
@@ -119,7 +230,7 @@ The profiling scripts will provide detailed performance metrics including:
 
 
 
-## Results
+## 📊 Results
 
 ### Performance Comparison
 
@@ -159,7 +270,7 @@ If you find this work useful in your research, please cite our paper:
 ```
 
 <!-- **Paper**: [FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models](https://arxiv.org/abs/2508.01506) -->
-
+<!-- 
 ## Project Structure
 
 ```
@@ -174,10 +285,10 @@ FlashSVD/
 ├── figs/                  # Paper figures and diagrams
 ├── train_*.py            # Training scripts for different models
 └── README.md             # This file
-```
+``` -->
 
 ## Contributing
 
 We welcome contributions! Please feel free to submit issues and pull requests.
 
-**Note**: This implementation is based on research work. For questions or issues, please open an issue on GitHub.
+**Note**: For support, feature requests, or collaborations, please open a GitHub issue or email Zishan (zs89@duke.edu).
