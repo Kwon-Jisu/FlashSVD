@@ -247,7 +247,7 @@ def main():
 
     dense = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR, config=cfg, trust_remote_code=True).to(device).eval()
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    loader = _build_loader(tok, seq_len=128*4, batch_size=64)
+    loader = _build_loader(tok, seq_len=2048, batch_size=16)
 
     # Clean memory and measure baseline (original dense model)
     torch.cuda.empty_cache()
@@ -295,7 +295,7 @@ def main():
 def test_model_replication():
     """Test that our custom ModernBERT reproduces the HF model."""
     print("=== Testing ModernBERT Replication ===")
-    BATCH_SIZE, SEQ_LEN = 8, 128*4
+    BATCH_SIZE, SEQ_LEN = 16, 2048
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 

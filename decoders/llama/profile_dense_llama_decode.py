@@ -43,7 +43,7 @@ RANK_Q=64 RANK_KV=64 RANK_O=2048 RANK_FF=2048 \
 python3 profile_dense_llama_decode.py
 
 
-CUDA_VISIBLE_DEVICES=0 LLAMA_MODEL=meta-llama/Llama-2-7b-hf DTYPE=float16 PROMPT_BATCH=16 PROMPT_LEN=256 DECODE_CURVE=128,256 RUNS=3 RANK_Q=64 RANK_KV=64 RANK_O=2048 RANK_FF=2048 SVD_DTYPE=bf16 SVD_COMPUTE_FP32=1 python3 profile_dense_llama_decode.py
+CUDA_VISIBLE_DEVICES=0 LLAMA_MODEL=meta-llama/Llama-2-7b-hf DTYPE=float16 PROMPT_BATCH=16 PROMPT_LEN=256 DECODE_CURVE=128,256 RUNS=1 MEM_TRACE=1 RANK_Q=64 RANK_KV=64 RANK_O=2048 RANK_FF=2048 SVD_DTYPE=bf16 SVD_COMPUTE_FP32=1 python3 profile_dense_llama_decode.py
 
 
 """
@@ -80,6 +80,16 @@ def _sync_and_reset():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+
+def _mem_stats_mib():
+    if not torch.cuda.is_available():
+        return dict(alloc=0.0, reserved=0.0, max_alloc=0.0, max_reserved=0.0)
+    return dict(
+        alloc=torch.cuda.memory_allocated() / MiB,
+        reserved=torch.cuda.memory_reserved() / MiB,
+        max_alloc=torch.cuda.max_memory_allocated() / MiB,
+        max_reserved=torch.cuda.max_memory_reserved() / MiB,
+    )
 
 # -------------------- attention helpers --------------------
 def _repeat_kv(x, n_rep: int):
@@ -374,6 +384,9 @@ class SVDLlamaBlock(nn.Module):
                 position_ids=None, use_cache: bool = False, **kw):
         B, T, _ = hidden_states.shape
         x = self.ln1(hidden_states)
+        if os.getenv("MEM_TRACE", "0") == "1" and torch.cuda.is_available():
+            ms = _mem_stats_mib(); li = getattr(self, "layer_idx", None)
+            print(f"[MEM] L{li} after ln1: alloc={ms['alloc']:.1f}MiB max={ms['max_alloc']:.1f}MiB")
 
         T_max = T
         x_trim = x[:, :T_max, :]
@@ -383,6 +396,9 @@ class SVDLlamaBlock(nn.Module):
         q = self._proj_per_head(x_trim, self.q_Us, self.q_V)     # [B,H,T,Dh]
         k_new = self._proj_per_head(x_trim, self.k_Us, self.k_V) # [B,Hk,T,Dh]
         v_new = self._proj_per_head(x_trim, self.v_Us, self.v_V)
+        if os.getenv("MEM_TRACE", "0") == "1" and torch.cuda.is_available():
+            ms = _mem_stats_mib(); li = getattr(self, "layer_idx", None)
+            print(f"[MEM] L{li} after q/k/v proj: alloc={ms['alloc']:.1f}MiB max={ms['max_alloc']:.1f}MiB")
 
         # RoPE (absolute)
         q     = self._apply_rope(q,     pos_ids)
@@ -403,6 +419,9 @@ class SVDLlamaBlock(nn.Module):
             else:
                 k_seq, v_seq = k_rot, v_new
             present_out = (k_seq, v_seq)
+        if os.getenv("MEM_TRACE", "0") == "1" and torch.cuda.is_available():
+            ms = _mem_stats_mib(); li = getattr(self, "layer_idx", None)
+            print(f"[MEM] L{li} after cache update: alloc={ms['alloc']:.1f}MiB max={ms['max_alloc']:.1f}MiB")
 
         # Attention via Triton FlashAttention (causal, with or without KV-cache)
         k = _repeat_kv(k_seq, self.rep)   # [B,H,Tk,Dh]
@@ -418,6 +437,9 @@ class SVDLlamaBlock(nn.Module):
         q_mask = torch.ones(B, self.H, 1, q_len, device=q.device, dtype=torch.bool)
         y = flash_attn_triton_unified(q, k, v, q_mask)  # [B,H,Q,Dh]
         y = y.transpose(1, 2).contiguous().view(B, T_max, self.D)
+        if os.getenv("MEM_TRACE", "0") == "1" and torch.cuda.is_available():
+            ms = _mem_stats_mib(); li = getattr(self, "layer_idx", None)
+            print(f"[MEM] L{li} after attn: alloc={ms['alloc']:.1f}MiB max={ms['max_alloc']:.1f}MiB")
 
         # Out + MLP
         if getattr(self, "use_lr_o", False):
@@ -434,6 +456,9 @@ class SVDLlamaBlock(nn.Module):
         else:
             ff = getattr(self, "down")(F.silu(getattr(self, "gate")(z)) * getattr(self, "up")(z))
         out = h + ff
+        if os.getenv("MEM_TRACE", "0") == "1" and torch.cuda.is_available():
+            ms = _mem_stats_mib(); li = getattr(self, "layer_idx", None)
+            print(f"[MEM] L{li} end layer: alloc={ms['alloc']:.1f}MiB max={ms['max_alloc']:.1f}MiB")
 
         return (out, present_out) if use_cache else (out,)
 
@@ -502,6 +527,7 @@ def profile_once(model: LlamaForCausalLM, tok: AutoTokenizer, device: str,
     torch.cuda.synchronize()
     prefill_ms = (time.perf_counter() - t0) * 1000.0
     prefill_peak_mib = torch.cuda.max_memory_allocated() / MiB
+    prefill_peak_reserved_mib = torch.cuda.max_memory_reserved() / MiB
 
     present = out.past_key_values  # DynamicCache
     next_ids = _next_from_last_hidden(model, out.last_hidden_state, greedy=True)
@@ -513,6 +539,7 @@ def profile_once(model: LlamaForCausalLM, tok: AutoTokenizer, device: str,
     kv_prefill_present_mib = _bytes_of_present(present)
     mem_after_prefill_mib = torch.cuda.memory_allocated() / MiB
     kv_prefill_alloc_mib = max(0.0, mem_after_prefill_mib - model_baseline_alloc_mib)
+    prefill_transient_overhead_mib = max(0.0, prefill_peak_mib - (model_baseline_alloc_mib + kv_prefill_alloc_mib))
 
     # -------- DECODE --------
     _sync_and_reset()
@@ -536,10 +563,12 @@ def profile_once(model: LlamaForCausalLM, tok: AutoTokenizer, device: str,
 
     decode_ms_per_tok = (t_decode * 1000.0) / max(1, decode_tokens)
     decode_peak_mib = torch.cuda.max_memory_allocated() / MiB
+    decode_peak_reserved_mib = torch.cuda.max_memory_reserved() / MiB
 
     kv_decode_present_mib = _bytes_of_present(present)
     mem_after_decode_mib = torch.cuda.memory_allocated() / MiB
     kv_decode_alloc_mib = max(0.0, mem_after_decode_mib - model_baseline_alloc_mib)
+    decode_transient_overhead_mib = max(0.0, decode_peak_mib - (model_baseline_alloc_mib + kv_decode_alloc_mib))
 
     del present, next_ids
     gc.collect(); torch.cuda.synchronize(); torch.cuda.empty_cache()
@@ -547,10 +576,14 @@ def profile_once(model: LlamaForCausalLM, tok: AutoTokenizer, device: str,
     return {
         "prefill_ms": prefill_ms,
         "prefill_peak_mib": prefill_peak_mib,
+        "prefill_peak_reserved_mib": prefill_peak_reserved_mib,
+        "prefill_transient_overhead_mib": prefill_transient_overhead_mib,
         "kv_prefill_present_mib": kv_prefill_present_mib,
         "kv_prefill_alloc_mib": kv_prefill_alloc_mib,
         "decode_ms_per_tok": decode_ms_per_tok,
         "decode_peak_mib": decode_peak_mib,
+        "decode_peak_reserved_mib": decode_peak_reserved_mib,
+        "decode_transient_overhead_mib": decode_transient_overhead_mib,
         "kv_decode_present_mib": kv_decode_present_mib,
         "kv_decode_alloc_mib": kv_decode_alloc_mib,
     }
@@ -635,6 +668,8 @@ if __name__ == "__main__":
         print(f"{'Decode  KV (MiB)':<24} | {last['kv_decode_present_mib']:>21.1f} | {last['kv_decode_alloc_mib']:>18.1f} | {expected_decode_mib:>12.1f}")
         print(f"{'(peaks, sanity)':<24} | {'prefill_peak':>21} | {'decode_peak':>18} |")
         print(f"{'':<24} | {last['prefill_peak_mib']:>21.1f} | {last['decode_peak_mib']:>18.1f} |")
+        print(f"{'(reserved peaks)':<24} | {last['prefill_peak_reserved_mib']:>21.1f} | {last['decode_peak_reserved_mib']:>18.1f} |")
+        print(f"{'(transient overhead)':<24} | {last['prefill_transient_overhead_mib']:>21.1f} | {last['decode_transient_overhead_mib']:>18.1f} |")
         print()
 
         print(f"---- Timing profile (averaged over RUNS) — decode_len={new_tokens} ----")

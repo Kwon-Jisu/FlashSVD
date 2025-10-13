@@ -670,7 +670,7 @@ def main():
     # Calculate real peak memory: remove construction overhead, add back original baseline
     real_peak_mib = peak_lr - with_act + original_baseline
     # Calculate transient memory: peak during inference minus persistent baseline
-    transient_mib = peak_lr - persistent_baseline
+    transient_mib = real_peak_mib - persistent_baseline # peak_lr - persistent_baseline
 
     print(f"FlashSVD     | acc={full_acc:.4f} | peak ={peak_lr:6.1f} MiB | real peak ={real_peak_mib:6.1f} MiB | Transient={transient_mib:6.1f} MiB | {latency_ms:6.1f} ms/b")
 
