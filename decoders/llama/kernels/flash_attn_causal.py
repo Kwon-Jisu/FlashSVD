@@ -41,7 +41,7 @@ def _load_tile(ptr, off_b, off_h, row_off,
     ptrs = (ptr + off_b * sPb + off_h * sPh
                  + offs_m[:, None] * sPm + offs_d[None, :] * sPd)
     mask = offs_m < seqlen
-    return tl.load(ptrs, mask=mask[:, None], other=0.).to(tl.float32)
+    return tl.load(ptrs, mask=mask[:, None], other=0.)
 
 
 @triton.autotune(configs=_fa_configs(), key=['seqlen', 'BLOCK_D'])
@@ -85,7 +85,7 @@ def _flashattn_kernel(
     q = _load_tile(Q_ptr, off_b, off_h, row_off,
                    sQb, sQh, sQm, sQd,
                    BLOCK_M, BLOCK_D, seqlen)
-    q = q * pad_q[:, None]
+    q = q * pad_q.to(q.dtype)[:, None]
 
     # online softmax accumulators
     acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
@@ -107,10 +107,10 @@ def _flashattn_kernel(
 
         # load K,V tiles
         k = _load_tile(K_ptr, off_b, off_h, kb, sKb, sKh, sKm, sKd, BLOCK_M, BLOCK_D, seqlen)
-        v = _load_tile(V_ptr, off_b, off_h, kb, sVb, sVh, sVm, sVd, BLOCK_M, BLOCK_D, seqlen)
+        v = _load_tile(V_ptr, off_b, off_h, kb, sVb, sVh, sVm, sVd, BLOCK_M, BLOCK_D, seqlen).to(tl.float32)
 
         # compute scores
-        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        qk = tl.dot(q, tl.trans(k)).to(tl.float32) * softmax_scale
 
         # combine masks; also invalidate out-of-range columns in last tile
         valid_col = offs_n < seqlen
@@ -209,7 +209,9 @@ def _flashattn_kvcache_kernel(
         acc      = acc * exp_diff[:, None] + tl.dot(tl.exp(qk - m_new[:, None]), v)
         m_i      = m_new
 
-    out = acc / tl.reshape(l_i, (BLOCK_M, 1))
+    # Guard against zero denominator (can happen with extreme masks / underflow)
+    den = tl.where(l_i > 0, l_i, 1.0)
+    out = acc / tl.reshape(den, (BLOCK_M, 1))
     out = out * pad_q[:, None]
 
     out_ptrs = Out_ptr + bh * sOb + offs_m[:, None] * sOm + offs_d[None, :] * sOd
@@ -260,17 +262,14 @@ def flash_attn_triton(Q: torch.Tensor,
 
     mask_bh1m = _ensure_mask_bh1m(mask, B, H, M).contiguous()
 
-    # Upcast
-    Qf, Kf, Vf = Q.float(), K.float(), V.float()
-
-    # Output is [B*H, M, D] for coalesced writes
-    Out = torch.empty(B * H, M, D, device=device, dtype=torch.float32)
+    # Output is [B*H, M, D]; keep in input dtype to reduce peak mem
+    Out = torch.empty(B * H, M, D, device=device, dtype=Q.dtype)
 
     # Kernel args
     args = [
-        Qf, Kf, Vf, Out, mask_bh1m,
+        Q, K, V, Out, mask_bh1m,
         *mask_bh1m.stride(),
-        *Qf.stride(), *Kf.stride(), *Vf.stride(),
+        *Q.stride(), *K.stride(), *V.stride(),
         *Out.stride(),
         M, H, softmax_scale,
     ]
@@ -319,15 +318,13 @@ def flash_attn_triton_kvcache(Q: torch.Tensor,
         assert mask.shape == (B, H, 1, seq_len)
         mask_bh1m = mask.contiguous()
 
-    # Upcast
-    Qf, Kf, Vf = Q.float(), K.float(), V.float()
-
-    Out = torch.empty(B * H, seq_len, D, device=device, dtype=torch.float32)
+    # Keep output in input dtype to avoid large fp32 buffer
+    Out = torch.empty(B * H, seq_len, D, device=device, dtype=Q.dtype)
 
     args = [
-        Qf, Kf, Vf, Out, mask_bh1m,
+        Q, K, V, Out, mask_bh1m,
         *mask_bh1m.stride(),
-        *Qf.stride(), *Kf.stride(), *Vf.stride(),
+        *Q.stride(), *K.stride(), *V.stride(),
         *Out.stride(),
         seq_len, kv_seq_len, H, softmax_scale,
     ]
