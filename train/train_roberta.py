@@ -20,7 +20,7 @@ task_name        = "stsb"                        # change as needed
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Chosen device at script start: {device}")
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 hf_logging.set_verbosity_error()
 model_id = "roberta-base"  # <-- switch to RoBERTa-base
 
@@ -163,7 +163,7 @@ trainer = Trainer(
 trainer.train()
 
 # 9) save
-out_dir = f"model/roberta-base-{task_name}"
+out_dir = f"models/roberta-base-{task_name}"
 os.makedirs(out_dir, exist_ok=True)
 trainer.save_model(out_dir)
 tokenizer.save_pretrained(out_dir)
