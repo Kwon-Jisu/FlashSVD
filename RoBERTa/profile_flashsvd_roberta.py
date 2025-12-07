@@ -24,7 +24,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 print(REPO_ROOT)
 task_name = "stsb"
-MODEL_DIR = os.path.join(REPO_ROOT, "models/RoBERTa", f"out_rte_roberta-base/checkpoint-468")
+MODEL_DIR = os.path.join(REPO_ROOT, "models/RoBERTa", f"roberta-base-{task_name}")
 
 from src.utils.metrics import acc_peak_time, compute_persistent_memory, summarize_dense_vs_lowrank
 from src.kernels.flashsvdattn import flash_svd_attention
