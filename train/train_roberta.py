@@ -14,7 +14,7 @@ from transformers import (
 )
 
 # 1) setup
-task_name        = "rte"                        # change as needed
+task_name        = "stsb"                        # change as needed
 
 # pick your device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -119,8 +119,16 @@ tok_val = raw[val_key].map(
 # 5) metrics
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
-    preds = np.argmax(logits, axis=-1)
-    return metric.compute(predictions=preds, references=labels)
+    
+    # STSB는 Regression이므로 squeeze만 하고 argmax를 하지 않음
+    if task_name == "stsb":
+        preds = logits.squeeze()
+        return metric.compute(predictions=preds, references=labels)
+    
+    # 다른 Task는 Classification이므로 argmax 수행
+    else:
+        preds = np.argmax(logits, axis=-1)
+        return metric.compute(predictions=preds, references=labels)
 
 # 6) training arguments
 training_args = TrainingArguments(
